@@ -1,0 +1,4560 @@
+// iTAP POS - Complete Database Schema
+// Database: itap_pos_dev
+// Uses same AWS RDS cluster but separate database
+//
+// UI Access Levels:
+// - TENANT_OWNER: Full admin portal access (setup, reports, billing)
+// - POS_ADMIN: Admin portal (setup, reports) + Counter POS
+// - POS_MANAGER: Limited admin (view reports) + Counter POS + Kitchen
+// - POS_STAFF: Counter POS only
+// - KITCHEN_STAFF: Kitchen Display only
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// SECTION 1: TENANT & ORGANIZATION
+// ============================================
+
+model Tenant {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String       @db.VarChar(255)
+  slug         String       @unique @db.VarChar(100)
+  status       TenantStatus @default(ACTIVE)
+  currency     String       @default("CAD") @db.VarChar(3)
+  timezone     String       @default("America/Toronto") @db.VarChar(50)
+  logoUrl      String?      @map("logo_url") @db.VarChar(500)
+  authProvider String       @default("cognito") @map("auth_provider") @db.VarChar(20)
+  businessType String       @default("restaurant") @map("business_type") @db.VarChar(20)
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  // Phase 5d (2026-05-18): per-tenant BYO Meta WhatsApp credentials
+  // (token-shaped fields encrypted at rest; phone_number_id stays plaintext
+  // for inbound-webhook reverse lookup)
+  metaPhoneNumberId         String?   @map("meta_phone_number_id") @db.VarChar(64)
+  metaWabaId                String?   @map("meta_waba_id") @db.VarChar(64)
+  metaAccessTokenEnc        String?   @map("meta_access_token_enc")
+  metaAppSecretEnc          String?   @map("meta_app_secret_enc")
+  metaWebhookVerifyTokenEnc String?   @map("meta_webhook_verify_token_enc")
+  metaDisplayName           String?   @map("meta_display_name") @db.VarChar(255)
+  metaConnectionType        String?   @map("meta_connection_type") @db.VarChar(20)
+  metaConnectedAt           DateTime? @map("meta_connected_at")
+  metaLastHealthCheckAt     DateTime? @map("meta_last_health_check_at")
+  metaHealthStatus          String?   @map("meta_health_status") @db.VarChar(20)
+
+  // Phase 6 (2026-05-18): public booking page top-level toggle
+  publicBookingEnabled Boolean @default(true) @map("public_booking_enabled")
+  bookingTagline       String? @map("booking_tagline") @db.VarChar(200)
+
+  // Relations
+  locations              Location[]
+  memberships            Membership[]
+  subscriptions          Subscription[]
+  settings               TenantSettings?
+  billingInvoices        BillingInvoice[]
+  categories             Category[]
+  products               Product[]
+  modifierGroups         ModifierGroup[]
+  ingredients            Ingredient[]
+  suppliers              Supplier[]
+  unitsOfMeasure         UnitOfMeasure[]
+  upsellRules            UpsellRule[]
+  smartPrompts           SmartPrompt[]
+  promotions             Promotion[]
+  loyaltyProgram         LoyaltyProgram?
+  kitchenLoadRules       KitchenLoadRule[]
+  // Phase 1 (2026-05-18): guest CRM + S3 uploads
+  guestProfiles          GuestProfile[]
+  uploadedFiles          UploadedFile[]
+  // Phase 5d (2026-05-18): inbound conversation inbox
+  conversationMessages   ConversationMessage[]
+  // Gift cards issued under this tenant
+  giftCards              GiftCard[]
+  cashDrawerSessions     CashDrawerSession[]
+  timeClockEntries       TimeClockEntry[]
+  taxCategories          TaxCategory[]
+  tipPools               TipPool[]
+  integrationConnections IntegrationConnection[]
+
+  // Phase 8 (2026-07-30): supplier marketplace.
+  //
+  // A Tenant with businessType='supplier' has a one-to-one SupplierProfile
+  // holding the marketplace-specific fields (warehouse, categories, min order,
+  // etc.). Merchant tenants never have this row. See SupplierProfile below.
+  supplierProfile         SupplierProfile?
+  // Invites this tenant SENT (merchant side). Only merchant tenants use this.
+  supplierInvitesSent     SupplierInvite[]               @relation("SupplierInvitesFromMerchant")
+  // Relationships where this tenant is the SUPPLIER — accepted by merchants.
+  asSupplierRelationships SupplierMerchantRelationship[] @relation("RelationshipSupplierSide")
+  // Relationships where this tenant is the MERCHANT — with suppliers we buy from.
+  asMerchantRelationships SupplierMerchantRelationship[] @relation("RelationshipMerchantSide")
+  // Local Supplier rows (inventory reference records on other tenants) that
+  // point to THIS supplier tenant once they've accepted an invite. Back-ref
+  // for Supplier.linkedTenantId — lets us find "who has me in their supplier
+  // list" from the supplier's side.
+  linkedFromSuppliers     Supplier[]                     @relation("SupplierLinkedTenant")
+  // Phase D #77 (2026-07-31): merchant Ingredients that name this tenant
+  // as their preferred marketplace supplier for auto-reorder. Only
+  // populated for supplier-tenants; merchant tenants keep this empty.
+  preferredForIngredients Ingredient[]                   @relation("IngredientPreferredSupplier")
+
+  // Phase B (2026-07-30): supplier catalog. Only populated for tenants with
+  // businessType='supplier'; merchant tenants keep these arrays empty.
+  supplierProductCategories SupplierProductCategory[]
+  supplierProducts          SupplierProduct[]
+  // Phase D #76 (2026-07-31): supplier fulfillment warehouses. Only
+  // populated for supplier tenants; single-location suppliers just have
+  // one row.
+  supplierWarehouses        SupplierWarehouse[]       @relation("SupplierWarehouses")
+
+  // Purchase orders — two sides. As SUPPLIER = orders received (fulfilled);
+  // as MERCHANT = orders sent (placed). Named relations because both point
+  // at the same Tenant table.
+  purchaseOrdersAsSupplier PurchaseOrder[] @relation("PurchaseOrderSupplier")
+  purchaseOrdersAsMerchant PurchaseOrder[] @relation("PurchaseOrderMerchant")
+
+  // Phase C (2026-07-30) / Phase 2b (2026-08): payment-gateway onboarding +
+  // active processor credentials. Populated for MERCHANT tenants (POS card
+  // acceptance) AND SUPPLIER tenants (marketplace payments). The tenantRole
+  // column on MerchantApplication distinguishes the two.
+  merchantApplications   MerchantApplication[]
+  tenantPaymentProviders TenantPaymentProvider[]
+
+  // Phase I #4 (2026-09-11): tenant approval flow. Mirrors tap-app.
+  // Admin app reads verification to render the pending-review queue and
+  // uses adminReviewerEmail + adminDecision to record approvals.
+  verification       TenantVerification?
+  verificationTokens TenantVerificationToken[]
+
+  @@index([metaPhoneNumberId], map: "idx_tenants_meta_phone_number_id")
+  @@map("tenants")
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+  // Phase I #4 (2026-09-11): mirrors tap-app enum. New signups land here.
+  PENDING_APPROVAL
+  REJECTED
+}
+
+// Phase I #4 (2026-09-11): tenant approval flow — mirrors tap-app.
+// Admin app reads this to render the pending-review queue and writes
+// admin_decision + rejection_reason on approve/reject.
+model TenantVerification {
+  tenantId             String    @id @map("tenant_id") @db.Uuid
+  contactEmail         String    @map("contact_email") @db.VarChar(255)
+  contactPhone         String?   @map("contact_phone") @db.VarChar(40)
+  emailVerifiedAt      DateTime? @map("email_verified_at")
+  phoneVerifiedAt      DateTime? @map("phone_verified_at")
+  adminReviewedAt      DateTime? @map("admin_reviewed_at")
+  adminReviewerEmail   String?   @map("admin_reviewer_email") @db.VarChar(255)
+  adminDecision        String?   @map("admin_decision") @db.VarChar(20)
+  adminNotes           String?   @map("admin_notes") @db.Text
+  rejectionReason      String?   @map("rejection_reason") @db.Text
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("tenant_verifications")
+}
+
+// Phase I #4 (2026-09-11): OTP token log — mirrors tap-app. Admin app
+// does not create rows (all OTP flow is applicant-side in tap-app) but
+// we model it here so support can query "which codes have we sent this
+// tenant" for troubleshooting a stuck signup.
+model TenantVerificationToken {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String    @map("tenant_id") @db.Uuid
+  channel       String    @db.VarChar(20)
+  transport     String?   @db.VarChar(20)
+  destination   String    @db.VarChar(255)
+  code          String    @db.VarChar(10)
+  expiresAt     DateTime  @map("expires_at")
+  consumedAt    DateTime? @map("consumed_at")
+  attemptsLeft  Int       @default(5) @map("attempts_left")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, channel, createdAt(sort: Desc)])
+  @@map("tenant_verification_tokens")
+}
+
+model Location {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId       String         @map("tenant_id") @db.Uuid
+  name           String         @db.VarChar(255)
+  address        String?        @db.VarChar(500)
+  city           String?        @db.VarChar(100)
+  province       String?        @db.VarChar(100)
+  postalCode     String?        @map("postal_code") @db.VarChar(20)
+  country        String         @default("CA") @db.VarChar(2)
+  phone          String?        @db.VarChar(20)
+  status         LocationStatus @default(ACTIVE)
+  isDefault      Boolean        @default(false) @map("is_default")
+  // Phase 3c (2026-05-18): public slug for embeddable virtual tour URL
+  // — /tour/<slug> works without auth, used by customer-facing booking
+  publicTourSlug String         @unique @map("public_tour_slug") @db.VarChar(100)
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  // Relations
+  tenant                   Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tables                   Table[]
+  kitchenStations          KitchenStation[]
+  locationInventory        LocationInventory[]
+  orders                   Order[]
+  stockMovements           StockMovement[]
+  tableSessions            TableSession[]
+  kitchenLoadRule          KitchenLoadRule?
+  staffNotifications       StaffNotification[]
+  terminals                Terminal[]
+  // Phase 1 (2026-05-18): floor plan + reservations
+  floorPlans               FloorPlan[]
+  reservations             Reservation[]
+  waitlistEntries          WaitlistEntry[]
+  sectionTemplates         SectionTemplate[]
+  serverSectionAssignments ServerSectionAssignment[]
+  specialDates             SpecialDate[]
+  guestArrivalEvents       GuestArrivalEvent[]
+  // Phase 3b (2026-05-18): restaurant media gallery (per-location)
+  mediaItems               MediaItem[] // located here on Location since MediaItem.locationId points here
+
+  // Phase 6 (2026-05-18): public customer booking page
+  publicBookingEnabled Boolean @default(true) @map("public_booking_enabled")
+  publicBookingSlug    String? @map("public_booking_slug") @db.VarChar(100)
+  operatingHours       Json?   @map("operating_hours")
+  bookingLeadMinutes   Int     @default(60) @map("booking_lead_minutes")
+  bookingSlotMinutes   Int     @default(30) @map("booking_slot_minutes")
+  bookingMaxPartySize  Int     @default(12) @map("booking_max_party_size")
+  bookingHeroMediaId   String? @map("booking_hero_media_id") @db.Uuid
+
+  // Phase 5d (2026-05-18): inbound conversation inbox (per-location optional)
+  conversationMessages ConversationMessage[]
+  cashDrawerSessions   CashDrawerSession[]
+  timeClockEntries     TimeClockEntry[]      @relation("TimeClockLocation")
+  taxRateOverrides     LocationTaxRate[]
+  tipPools             TipPool[]             @relation("TipPoolLocation")
+
+  // Phase B (2026-07-30): purchase orders shipped to this location.
+  // A merchant may have multiple locations and order to a specific one.
+  purchaseOrdersShippedTo PurchaseOrder[] @relation("PurchaseOrderShippingLocation")
+
+  @@unique([tenantId, publicBookingSlug], map: "uniq_locations_tenant_booking_slug")
+  @@index([tenantId])
+  @@map("locations")
+}
+
+enum LocationStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// ============================================
+// SECTION 2: MEMBERSHIP & RBAC
+// ============================================
+
+model Membership {
+  id        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String       @map("tenant_id") @db.Uuid
+  userSub   String       @map("user_sub") @db.VarChar(255) // Cognito sub OR 'local-{email}' for POS staff
+  email     String       @db.VarChar(255)
+  firstName String?      @map("first_name") @db.VarChar(100)
+  lastName  String?      @map("last_name") @db.VarChar(100)
+  role      MemberRole   @default(POS_STAFF)
+  status    MemberStatus @default(PENDING)
+  pin       String?      @db.VarChar(10) // Quick login PIN for POS
+
+  // Phase 4 (2026-05-18): per-server color for floor view visual identification
+  color String? @db.VarChar(7) // hex like '#3B82F6'
+
+  // Local POS Authentication (for staff without Cognito accounts)
+  passwordHash       String?   @map("password_hash") @db.VarChar(255) // bcrypt hashed password
+  mustChangePassword Boolean   @default(true) @map("must_change_password") // Force password change on first login
+  lastPasswordChange DateTime? @map("last_password_change")
+  loginAttempts      Int       @default(0) @map("login_attempts") // For rate limiting
+  lockedUntil        DateTime? @map("locked_until") // Account lockout after failed attempts
+
+  // Password reset (for partner DB auth)
+  passwordResetToken   String?   @map("password_reset_token") @db.VarChar(255)
+  passwordResetExpires DateTime? @map("password_reset_expires")
+
+  // Salon/Technician fields
+  specialties    String[] @default([]) // Array of product IDs this technician can perform
+  commissionRate Decimal? @map("commission_rate") @db.Decimal(5, 2) // Percentage commission per service
+
+  invitedBy    String?   @map("invited_by") @db.Uuid
+  invitedAt    DateTime? @map("invited_at")
+  activatedAt  DateTime? @map("activated_at")
+  lastActiveAt DateTime? @map("last_active_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  tenant                   Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ordersCreated            Order[]                   @relation("CreatedByMember")
+  stockMovements           StockMovement[]           @relation("StockMovementBy")
+  kitchenQueueUpdates      KitchenQueue[]            @relation("KitchenUpdatedBy")
+  assignedServices         OrderItem[]               @relation("TechnicianAssignments")
+  // Phase 1 (2026-05-18): floor plan + reservations back-refs
+  floorPlansPublished      FloorPlan[]               @relation("FloorPlanPublishedBy")
+  floorPlanVersionsSaved   FloorPlanVersion[]        @relation("FloorPlanVersionSavedBy")
+  guestProfilesAsFavorite  GuestProfile[]            @relation("GuestFavoriteServer")
+  reservationsCreated      Reservation[]             @relation("ReservationCreatedBy")
+  serverSectionAssignments ServerSectionAssignment[] @relation("ServerSectionAssignment")
+  filesUploaded            UploadedFile[]            @relation("FileUploadedBy")
+  // Phase 3b (2026-05-18): media uploads
+  mediaUploaded            MediaItem[]               @relation("MediaUploadedBy")
+  // Phase 4 (2026-05-18): tables this server is currently assigned to
+  tablesAsCurrentServer    Table[]                   @relation("TableCurrentServer")
+  // Gift cards this member issued
+  giftCardsIssued          GiftCard[]                @relation("GiftCardIssuedBy")
+  // Cash drawer activity
+  cashDrawersOpened        CashDrawerSession[]       @relation("CashDrawerOpenedBy")
+  cashDrawersClosed        CashDrawerSession[]       @relation("CashDrawerClosedBy")
+  cashMovementsBy          CashMovement[]            @relation("CashMovementBy")
+  timeClockEntries         TimeClockEntry[]          @relation("TimeClockEntries")
+  tipPoolsCreated          TipPool[]                 @relation("TipPoolCreatedBy")
+  tipPoolsClosed           TipPool[]                 @relation("TipPoolClosedBy")
+  tipDistributions         TipDistribution[]         @relation("TipDistributionMember")
+  integrationsConnected    IntegrationConnection[]   @relation("IntegrationConnectedBy")
+
+  // Phase B (2026-07-30): purchase-order audit trail.
+  purchaseOrdersCreated   PurchaseOrder[] @relation("PurchaseOrderCreatedBy")
+  purchaseOrdersCancelled PurchaseOrder[] @relation("PurchaseOrderCancelledBy")
+
+  // Phase C (2026-07-30) / Phase 2b (2026-08): the tenant member who filed
+  // a merchant/supplier application, plus the tenant member who uploaded a
+  // KYB document (either can be a merchant OWNER or a supplier owner).
+  merchantApplicationsCreated MerchantApplication[] @relation("MerchantApplicationCreatedBy")
+  kybDocumentsUploaded        KybDocument[]         @relation("KybDocumentUploadedBy")
+
+  // Phase D #74 (2026-07-30): PO messages this member sent.
+  poMessagesSent PurchaseOrderMessage[] @relation("PoMessageSender")
+
+  // Phase E R1 (2026-07-31): per-technician working hours + time off
+  // for appointment availability. Only technicians have these; other
+  // roles keep the arrays empty.
+  schedules StaffSchedule[]
+  timeOff   StaffTimeOff[]
+
+  @@unique([tenantId, userSub])
+  @@unique([tenantId, email])
+  @@index([userSub])
+  @@index([email])
+  @@map("memberships")
+}
+
+enum MemberRole {
+  TENANT_OWNER // Full access: Admin Portal + All
+  POS_ADMIN // Admin Portal (no billing) + Counter + Kitchen
+  POS_MANAGER // Reports (view only) + Counter + Kitchen
+  POS_STAFF // Counter POS only
+  KITCHEN_STAFF // Kitchen Display only
+}
+
+enum MemberStatus {
+  PENDING // Invited but not activated
+  ACTIVE // Full access
+  SUSPENDED // Temporarily disabled
+}
+
+// ============================================
+// SECTION 3: SUBSCRIPTION & BILLING
+// ============================================
+
+model Subscription {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId           String             @map("tenant_id") @db.Uuid
+  plan               String             @default("standard") @db.VarChar(50)
+  status             SubscriptionStatus @default(TRIAL)
+  monthlyPrice       Int                @default(0) @map("monthly_price") // in cents
+  trialEndsAt        DateTime?          @map("trial_ends_at")
+  currentPeriodStart DateTime?          @map("current_period_start")
+  currentPeriodEnd   DateTime?          @map("current_period_end")
+  cancelledAt        DateTime?          @map("cancelled_at")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("subscriptions")
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+}
+
+// B2B Monthly Billing Invoices (for subscription)
+model BillingInvoice {
+  id             String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId       String               @map("tenant_id") @db.Uuid
+  invoiceNumber  String               @unique @map("invoice_number") @db.VarChar(50)
+  amount         Int // in cents
+  currency       String               @default("CAD") @db.VarChar(3)
+  status         BillingInvoiceStatus @default(SENT)
+  periodStart    DateTime             @map("period_start")
+  periodEnd      DateTime             @map("period_end")
+  dueDate        DateTime             @map("due_date")
+  paidAt         DateTime?            @map("paid_at")
+  paymentRef     String?              @map("payment_ref") @db.VarChar(255)
+  paymentQrUrl   String?              @map("payment_qr_url") @db.VarChar(500)
+  remindersSent  Int                  @default(0) @map("reminders_sent")
+  lastReminderAt DateTime?            @map("last_reminder_at")
+  createdAt      DateTime             @default(now()) @map("created_at")
+  updatedAt      DateTime             @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([dueDate])
+  @@map("billing_invoices")
+}
+
+enum BillingInvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+// ============================================
+// SECTION 4: TENANT SETTINGS
+// ============================================
+
+model TenantSettings {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @unique @map("tenant_id") @db.Uuid
+
+  // Tax settings
+  taxEnabled Boolean @default(true) @map("tax_enabled")
+  taxRate    Decimal @default(13.00) @map("tax_rate") @db.Decimal(5, 2)
+  taxLabel   String  @default("HST") @map("tax_label") @db.VarChar(20)
+
+  // Secondary tax (e.g., PST in some provinces)
+  tax2Enabled Boolean @default(false) @map("tax2_enabled")
+  tax2Rate    Decimal @default(0) @map("tax2_rate") @db.Decimal(5, 2)
+  tax2Label   String  @default("PST") @map("tax2_label") @db.VarChar(20)
+
+  // Cash discount / dual pricing — SURCHARGE adds X% to card payments,
+  // DISCOUNT subtracts X% for cash. Both are allowed under most US state
+  // laws + CA (with disclosure). Percent capped at 15 by a DB CHECK.
+  cashDiscountEnabled Boolean @default(false) @map("cash_discount_enabled")
+  cashDiscountPercent Decimal @default(0) @map("cash_discount_percent") @db.Decimal(5, 2)
+  cashDiscountMode    String  @default("SURCHARGE") @map("cash_discount_mode") @db.VarChar(20)
+  cashDiscountLabel   String? @map("cash_discount_label") @db.VarChar(60)
+
+  // Tip settings
+  tipEnabled       Boolean @default(true) @map("tip_enabled")
+  tipPresets       Json    @default("[15, 18, 20]") @map("tip_presets")
+  tipCustomEnabled Boolean @default(true) @map("tip_custom_enabled")
+
+  // Receipt settings
+  receiptHeader  String? @map("receipt_header") @db.Text
+  receiptFooter  String? @map("receipt_footer") @db.Text
+  receiptLogoUrl String? @map("receipt_logo_url") @db.VarChar(500)
+
+  // Order settings
+  orderNumberPrefix String           @default("") @map("order_number_prefix") @db.VarChar(10)
+  orderNumberReset  OrderNumberReset @default(DAILY) @map("order_number_reset")
+  lastOrderNumber   Int              @default(0) @map("last_order_number")
+  lastOrderDate     DateTime?        @map("last_order_date")
+
+  // Kitchen settings
+  kitchenDisplayEnabled Boolean @default(true) @map("kitchen_display_enabled")
+  kitchenAlertSound     Boolean @default(true) @map("kitchen_alert_sound")
+  prepTimeEnabled       Boolean @default(true) @map("prep_time_enabled")
+
+  // Display settings
+  customerDisplayEnabled     Boolean @default(true) @map("customer_display_enabled")
+  showOrderDetails           Boolean @default(true) @map("show_order_details")
+  // Salon next-appointment board: opt-in to show customer first names on
+  // the public board (default false → board shows "Guest #0042").
+  appointmentDisplayShowName Boolean @default(false) @map("appointment_display_show_name")
+
+  // SMS integration (Phase 5e). Per-tenant — partners pick between the
+  // shared ZASHX AWS SNS sender (no setup, billed per message) or BYO
+  // Twilio credentials (advanced).
+  smsEnabled             Boolean   @default(false) @map("sms_enabled")
+  smsProvider            String    @default("shared") @map("sms_provider") @db.VarChar(20) // "shared" | "twilio"
+  smsSenderLabel         String?   @map("sms_sender_label") @db.VarChar(60) // prepended to message body in shared mode
+  smsTwilioAccountSidEnc String?   @map("sms_twilio_account_sid_enc")
+  smsTwilioAuthTokenEnc  String?   @map("sms_twilio_auth_token_enc")
+  smsTwilioFromNumber    String?   @map("sms_twilio_from_number") @db.VarChar(20)
+  smsConnectedAt         DateTime? @map("sms_connected_at")
+
+  // Google Business Profile integration (Phase 5e). OAuth-based — partner
+  // signs in with the Google account that owns their GBP listing. Tokens
+  // encrypted at rest. Location/Account IDs are GBP's internal resource
+  // names ("accounts/123/locations/456") — needed for every API call.
+  gbpConnected        Boolean   @default(false) @map("gbp_connected")
+  gbpAccountResource  String?   @map("gbp_account_resource") @db.VarChar(120) // e.g. "accounts/1234567890"
+  gbpLocationResource String?   @map("gbp_location_resource") @db.VarChar(120) // e.g. "locations/9876543210"
+  gbpLocationName     String?   @map("gbp_location_name") @db.VarChar(255) // human-readable
+  gbpAccessTokenEnc   String?   @map("gbp_access_token_enc")
+  gbpRefreshTokenEnc  String?   @map("gbp_refresh_token_enc")
+  gbpTokenExpiresAt   DateTime? @map("gbp_token_expires_at")
+  gbpConnectedAt      DateTime? @map("gbp_connected_at")
+  gbpLastSyncAt       DateTime? @map("gbp_last_sync_at")
+  gbpLastSyncStatus   String?   @map("gbp_last_sync_status") @db.VarChar(20) // "ok" | "error"
+  gbpLastSyncError    String?   @map("gbp_last_sync_error") @db.Text
+
+  // Inventory settings
+  lowStockAlertEnabled Boolean @default(true) @map("low_stock_alert_enabled")
+  autoDeductInventory  Boolean @default(true) @map("auto_deduct_inventory")
+
+  // Digital Waiter / Table Ordering settings
+  tableOrderingEnabled Boolean          @default(true) @map("table_ordering_enabled")
+  tablePaymentType     TablePaymentType @default(UPFRONT) @map("table_payment_type") // UPFRONT = pay before order, PAY_AT_END = pay when leaving
+  allowGuestOrdering   Boolean          @default(true) @map("allow_guest_ordering") // Multiple guests can add to same session
+
+  // Payment Terminal settings
+  paymentTerminalEnabled Boolean @default(false) @map("payment_terminal_enabled")
+  quickChipEnabled       Boolean @default(false) @map("quick_chip_enabled")
+  lineItemDisplayEnabled Boolean @default(true) @map("line_item_display_enabled")
+
+  // White-label branding
+  brandName            String? @map("brand_name") @db.VarChar(255)
+  // Widened to Text so a base64 data URL (~50–500KB) fits alongside
+  // regular external URLs — same pattern as Product.imageUrl.
+  brandLogoUrl         String? @map("brand_logo_url") @db.Text
+  brandFaviconUrl      String? @map("brand_favicon_url") @db.VarChar(500)
+  brandPrimaryColor    String  @default("#4F46E5") @map("brand_primary_color") @db.VarChar(7)
+  brandAccentColor     String  @default("#6366F1") @map("brand_accent_color") @db.VarChar(7)
+  brandBackgroundColor String  @default("#F9FAFB") @map("brand_background_color") @db.VarChar(7)
+  poweredByVisible     Boolean @default(true) @map("powered_by_visible")
+  customDomain         String? @unique @map("custom_domain") @db.VarChar(255)
+
+  // Salon/Appointment settings
+  appointmentBookingEnabled Boolean @default(false) @map("appointment_booking_enabled")
+  bufferTimeMinutes         Int     @default(15) @map("buffer_time_minutes")
+
+  // Phase E R2 (2026-07-31): reservation duration matrix — party-size
+  // buckets → seating minutes. Server reads when the client doesn't
+  // send an explicit estimatedDurationMinutes. Bucket keys are strings
+  // ("1-2", "3-4", "5-6", "7+") so the JSON is self-documenting.
+  partySizeDurationMap         Json @default("{\"1-2\": 60, \"3-4\": 90, \"5-6\": 120, \"7+\": 150}") @map("party_size_duration_map")
+  // Turn buffer added to a reservation's window when checking for
+  // overlapping bookings (cleanup / turn time between parties).
+  reservationTurnBufferMinutes Int  @default(15) @map("reservation_turn_buffer_minutes")
+
+  // Phase E R4 (2026-07-31): how close to a booking a customer can
+  // cancel and still get a full refund. Displayed on the confirmation
+  // + reminder messages so the customer knows the cutoff. Round 4b
+  // will wire this into the actual refund path (needs deposit flow).
+  cancellationWindowMinutes Int @default(30) @map("cancellation_window_minutes")
+
+  // Phase E R6 (2026-07-31): appointment deposit flow. PUBLIC booking
+  // only — POS-created appointments are pay-at-service. When require*
+  // is true the confirm step redirects the customer to a hosted
+  // deposit checkout; on success the appointment flips from
+  // PENDING_PAYMENT → NEW.
+  requireAppointmentDeposit Boolean @default(false) @map("require_appointment_deposit")
+  // "PERCENT" (of subtotal) or "FIXED" (cents).
+  appointmentDepositType    String  @default("PERCENT") @map("appointment_deposit_type") @db.VarChar(10)
+  // Interpret per type: PERCENT=0..100 (25 = 25%); FIXED=cents (2500 = $25.00).
+  appointmentDepositValue   Int     @default(25) @map("appointment_deposit_value")
+  bookingAdvanceDays        Int     @default(30) @map("booking_advance_days")
+  walkInEnabled             Boolean @default(true) @map("walk_in_enabled")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("tenant_settings")
+}
+
+enum OrderNumberReset {
+  DAILY // Reset to 1 each day
+  NEVER // Continuous numbering
+}
+
+enum TablePaymentType {
+  UPFRONT // Pay before order is sent to kitchen (like fast food)
+  PAY_AT_END // Pay when leaving (traditional restaurant)
+}
+
+// ============================================
+// SECTION 5: PRODUCT CATALOG
+// ============================================
+
+// Menu Categories
+model Category {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String   @db.VarChar(100)
+  description String?  @db.VarChar(500)
+  imageUrl    String?  @map("image_url") @db.VarChar(500) // External URL
+  sortOrder   Int      @default(0) @map("sort_order")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@map("categories")
+}
+
+// Products / Menu Items
+model Product {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId   String @map("tenant_id") @db.Uuid
+  categoryId String @map("category_id") @db.Uuid
+
+  // Basic info
+  name        String  @db.VarChar(255)
+  description String? @db.Text
+  sku         String? @db.VarChar(50) // Internal code
+  barcode     String? @db.VarChar(50) // For scanning
+
+  // Optional tax category — nullable, falls back to TenantSettings.taxRate
+  taxCategoryId String? @map("tax_category_id") @db.Uuid
+
+  // Pricing (in cents)
+  basePrice  Int @map("base_price")
+  costPrice  Int @default(0) @map("cost_price") // Manual cost entry
+  labourCost Int @default(0) @map("labour_cost") // Labour cost per item
+
+  // Display
+  imageUrl  String? @map("image_url") @db.Text // External URL or inline base64 data URL
+  sortOrder Int     @default(0) @map("sort_order")
+
+  // Availability
+  isActive       Boolean @default(true) @map("is_active")
+  isAvailable    Boolean @default(true) @map("is_available") // Can be sold (not out of stock)
+  trackInventory Boolean @default(false) @map("track_inventory") // Track via ingredients
+
+  // Kitchen
+  prepTimeMinutes Int @default(0) @map("prep_time_minutes")
+
+  // Salon/Service fields
+  durationMinutes    Int?    @map("duration_minutes") // Service duration in minutes (null for restaurant products)
+  requiresTechnician Boolean @default(false) @map("requires_technician")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant                Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category              Category               @relation(fields: [categoryId], references: [id])
+  taxCategory           TaxCategory?           @relation(fields: [taxCategoryId], references: [id], onDelete: SetNull)
+  variants              ProductVariant[]
+  productModifierGroups ProductModifierGroup[]
+  productAllergens      ProductAllergen[]
+  recipes               Recipe[]
+  orderItems            OrderItem[]
+  stationProducts       StationProduct[]
+  guestCartItems        GuestCartItem[]
+
+  @@index([tenantId])
+  @@index([categoryId])
+  @@index([tenantId, isActive])
+  @@index([barcode])
+  @@index([taxCategoryId])
+  @@map("products")
+}
+
+// Product Variants (Small, Medium, Large, etc.)
+model ProductVariant {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId       String   @map("product_id") @db.Uuid
+  name            String   @db.VarChar(100) // "Small", "Large", "Spicy"
+  priceAdjustment Int      @default(0) @map("price_adjustment") // +/- cents
+  costAdjustment  Int      @default(0) @map("cost_adjustment") // +/- cents
+  sortOrder       Int      @default(0) @map("sort_order")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  // Relations
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@index([productId])
+  @@map("product_variants")
+}
+
+// Modifier Groups (e.g., "Choose your sauce", "Add toppings")
+model ModifierGroup {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String   @db.VarChar(100)
+  displayName String?  @map("display_name") @db.VarChar(100) // Shown to customer
+  isRequired  Boolean  @default(false) @map("is_required")
+  minSelect   Int      @default(0) @map("min_select")
+  maxSelect   Int      @default(1) @map("max_select") // 0 = unlimited
+  sortOrder   Int      @default(0) @map("sort_order")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant                Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  modifiers             Modifier[]
+  productModifierGroups ProductModifierGroup[]
+
+  @@index([tenantId])
+  @@map("modifier_groups")
+}
+
+// Individual Modifiers (e.g., "Extra Cheese", "No Onions")
+model Modifier {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  groupId   String   @map("group_id") @db.Uuid
+  name      String   @db.VarChar(100)
+  price     Int      @default(0) // Additional price in cents
+  cost      Int      @default(0) // Cost in cents
+  sortOrder Int      @default(0) @map("sort_order")
+  isDefault Boolean  @default(false) @map("is_default") // Pre-selected
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  group              ModifierGroup       @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  orderItemModifiers OrderItemModifier[]
+
+  @@index([groupId])
+  @@map("modifiers")
+}
+
+// Link Products to Modifier Groups
+model ProductModifierGroup {
+  id              String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId       String @map("product_id") @db.Uuid
+  modifierGroupId String @map("modifier_group_id") @db.Uuid
+  sortOrder       Int    @default(0) @map("sort_order")
+
+  // Relations
+  product       Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  modifierGroup ModifierGroup @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, modifierGroupId])
+  @@map("product_modifier_groups")
+}
+
+// ============================================
+// SECTION 6: ALLERGENS
+// ============================================
+
+// Master Allergen List (can be tenant-specific or global)
+model Allergen {
+  id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code      String           @unique @db.VarChar(20) // NUTS, DAIRY, GLUTEN, etc.
+  name      String           @db.VarChar(100)
+  icon      String?          @db.VarChar(50) // Icon name or emoji
+  severity  AllergenSeverity @default(HIGH)
+  isGlobal  Boolean          @default(true) @map("is_global") // Available to all tenants
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  // Relations
+  productAllergens    ProductAllergen[]
+  ingredientAllergens IngredientAllergen[]
+  orderItemAllergens  OrderItemAllergen[]
+
+  @@map("allergens")
+}
+
+enum AllergenSeverity {
+  HIGH // Life-threatening (nuts, shellfish)
+  MEDIUM // Significant reaction (dairy, gluten)
+  LOW // Mild sensitivity
+}
+
+// Link Products to Allergens
+model ProductAllergen {
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId    String  @map("product_id") @db.Uuid
+  allergenId   String  @map("allergen_id") @db.Uuid
+  isFromRecipe Boolean @default(false) @map("is_from_recipe") // Auto-inherited from ingredients
+
+  // Relations
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  allergen Allergen @relation(fields: [allergenId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, allergenId])
+  @@map("product_allergens")
+}
+
+// ============================================
+// SECTION 7: INVENTORY & INGREDIENTS
+// ============================================
+
+// Units of Measure
+model UnitOfMeasure {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Uuid
+  name             String   @db.VarChar(50) // Kilogram, Gram, Liter, Piece
+  symbol           String   @db.VarChar(10) // kg, g, L, pc
+  type             UnitType // WEIGHT, VOLUME, COUNT
+  baseUnit         String?  @map("base_unit") @db.VarChar(10) // g, ml, pc (for conversions)
+  conversionFactor Decimal  @default(1) @map("conversion_factor") @db.Decimal(10, 4)
+  isActive         Boolean  @default(true) @map("is_active")
+
+  // Relations
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ingredients Ingredient[]
+  recipes     Recipe[]
+
+  @@unique([tenantId, symbol])
+  @@map("units_of_measure")
+}
+
+enum UnitType {
+  WEIGHT // kg, g, lb, oz
+  VOLUME // L, ml, gal
+  COUNT // pc, dozen, box
+}
+
+// Suppliers — per-tenant INVENTORY reference records (contact info + notes,
+// no login). Existed before the marketplace; kept as-is so inventory pages
+// keep working.
+//
+// linkedTenantId (Phase 8, 2026-07-30) optionally points to the supplier's
+// own marketplace tenant once they've accepted a merchant's invite. When set,
+// this local record represents a "real" supplier we can order from through
+// the marketplace; when null, it's just a paper record for inventory tracking.
+model Supplier {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId       String   @map("tenant_id") @db.Uuid
+  name           String   @db.VarChar(255)
+  contactName    String?  @map("contact_name") @db.VarChar(100)
+  phone          String?  @db.VarChar(20)
+  email          String?  @db.VarChar(255)
+  address        String?  @db.Text
+  notes          String?  @db.Text
+  isActive       Boolean  @default(true) @map("is_active")
+  linkedTenantId String?  @map("linked_tenant_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  linkedTenant Tenant?      @relation("SupplierLinkedTenant", fields: [linkedTenantId], references: [id], onDelete: SetNull)
+  ingredients  Ingredient[]
+
+  @@index([tenantId])
+  @@index([linkedTenantId])
+  @@map("suppliers")
+}
+
+// Ingredients (Raw Materials)
+model Ingredient {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String  @map("tenant_id") @db.Uuid
+  name        String  @db.VarChar(255)
+  description String? @db.Text
+  sku         String? @db.VarChar(50)
+
+  // Unit & Cost
+  unitId      String @map("unit_id") @db.Uuid
+  costPerUnit Int    @default(0) @map("cost_per_unit") // Cost in cents per unit
+
+  // Stock Management. `lowStockThreshold` doubles as the PAR level for
+  // auto-reorder (Phase D #77) — same concept, no duplicate column.
+  lowStockThreshold Decimal @default(0) @map("low_stock_threshold") @db.Decimal(10, 3)
+
+  // Supplier
+  supplierId  String? @map("supplier_id") @db.Uuid
+  supplierSku String? @map("supplier_sku") @db.VarChar(50)
+
+  // Phase D #77 (2026-07-31): auto-reorder from par levels. When
+  // autoReorderEnabled is true AND stock drops below lowStockThreshold,
+  // the system drafts (or auto-submits) a PO to preferredSupplierTenantId
+  // for reorderQty of preferredSupplierProductId. All fields must be set
+  // together — the evaluator skips rows with any of them missing.
+  reorderQty                 Decimal?  @map("reorder_qty") @db.Decimal(10, 3)
+  preferredSupplierTenantId  String?   @map("preferred_supplier_tenant_id") @db.Uuid
+  preferredSupplierProductId String?   @map("preferred_supplier_product_id") @db.Uuid
+  autoReorderEnabled         Boolean   @default(false) @map("auto_reorder_enabled")
+  // Cooldown so a burst of sales doesn't spam POs. Evaluator refuses to
+  // draft again within a 24h window unless the last draft was cancelled.
+  lastAutoReorderAt          DateTime? @map("last_auto_reorder_at")
+
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant                   Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  unit                     UnitOfMeasure        @relation(fields: [unitId], references: [id])
+  supplier                 Supplier?            @relation(fields: [supplierId], references: [id])
+  allergens                IngredientAllergen[]
+  recipes                  Recipe[]
+  locationInventory        LocationInventory[]
+  stockMovements           StockMovement[]
+  preferredSupplierTenant  Tenant?              @relation("IngredientPreferredSupplier", fields: [preferredSupplierTenantId], references: [id], onDelete: SetNull)
+  preferredSupplierProduct SupplierProduct?     @relation("IngredientPreferredSupplierProduct", fields: [preferredSupplierProductId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([supplierId])
+  @@map("ingredients")
+}
+
+// Link Ingredients to Allergens
+model IngredientAllergen {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ingredientId String @map("ingredient_id") @db.Uuid
+  allergenId   String @map("allergen_id") @db.Uuid
+
+  // Relations
+  ingredient Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+  allergen   Allergen   @relation(fields: [allergenId], references: [id], onDelete: Cascade)
+
+  @@unique([ingredientId, allergenId])
+  @@map("ingredient_allergens")
+}
+
+// Recipes - Link Products to Ingredients
+model Recipe {
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId    String  @map("product_id") @db.Uuid
+  ingredientId String  @map("ingredient_id") @db.Uuid
+  quantity     Decimal @db.Decimal(10, 4) // Amount of ingredient needed
+  unitId       String  @map("unit_id") @db.Uuid
+
+  // Relations
+  product    Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  ingredient Ingredient    @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+  unit       UnitOfMeasure @relation(fields: [unitId], references: [id])
+
+  @@unique([productId, ingredientId])
+  @@map("recipes")
+}
+
+// Inventory per Location
+model LocationInventory {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId    String    @map("location_id") @db.Uuid
+  ingredientId  String    @map("ingredient_id") @db.Uuid
+  currentStock  Decimal   @default(0) @map("current_stock") @db.Decimal(10, 3)
+  lastCountedAt DateTime? @map("last_counted_at")
+  lastCountedBy String?   @map("last_counted_by") @db.Uuid
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  location   Location   @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  ingredient Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+
+  @@unique([locationId, ingredientId])
+  @@index([ingredientId])
+  @@map("location_inventory")
+}
+
+// Stock Movements (Audit Trail)
+model StockMovement {
+  id            String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId    String            @map("location_id") @db.Uuid
+  ingredientId  String            @map("ingredient_id") @db.Uuid
+  type          StockMovementType
+  quantity      Decimal           @db.Decimal(10, 3) // Positive for IN, negative for OUT
+  previousStock Decimal           @map("previous_stock") @db.Decimal(10, 3)
+  newStock      Decimal           @map("new_stock") @db.Decimal(10, 3)
+  reason        String?           @db.VarChar(255)
+  orderId       String?           @map("order_id") @db.Uuid // If deducted for order
+  performedById String?           @map("performed_by_id") @db.Uuid
+  createdAt     DateTime          @default(now()) @map("created_at")
+
+  // Relations
+  location    Location    @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  ingredient  Ingredient  @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+  order       Order?      @relation(fields: [orderId], references: [id])
+  performedBy Membership? @relation("StockMovementBy", fields: [performedById], references: [id])
+
+  @@index([locationId, ingredientId])
+  @@index([createdAt])
+  @@map("stock_movements")
+}
+
+enum StockMovementType {
+  PURCHASE // Stock received from supplier
+  SALE // Deducted for order
+  ADJUSTMENT // Manual count adjustment
+  WASTE // Spoilage/waste
+  TRANSFER_IN // Received from another location
+  TRANSFER_OUT // Sent to another location
+  RETURN // Returned to supplier
+}
+
+// ============================================
+// SECTION 8: TABLES & DIGITAL WAITER
+// ============================================
+
+model Table {
+  id          String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId  String      @map("location_id") @db.Uuid
+  tableNumber String      @map("table_number") @db.VarChar(20) // "1", "A1", "Patio-3"
+  name        String?     @db.VarChar(50) // "Window Seat", "VIP Booth"
+  capacity    Int         @default(4)
+  status      TableStatus @default(AVAILABLE)
+  sortOrder   Int         @default(0) @map("sort_order")
+  isActive    Boolean     @default(true) @map("is_active")
+
+  // QR Code for self-ordering
+  qrCode           String? @unique @map("qr_code") @db.VarChar(50) // Unique QR identifier
+  qrCodeUrl        String? @map("qr_code_url") @db.Text // Generated QR image data URL (base64)
+  currentSessionId String? @map("current_session_id") @db.Uuid
+
+  // ─────────────────────────────────────────────────────────────
+  // Floor plan integration (Phase 1, 2026-05-18)
+  // Existing rows have nullable floorPlanId/sectionId; new tables
+  // created via the visual editor will have them populated.
+  // ─────────────────────────────────────────────────────────────
+  floorPlanId   String?    @map("floor_plan_id") @db.Uuid
+  sectionId     String?    @map("section_id") @db.Uuid
+  displayLabel  String?    @map("display_label") @db.VarChar(50) // optional alt vs tableNumber
+  shape         TableShape @default(ROUND)
+  customPolygon Json?      @map("custom_polygon") // for shape=CUSTOM (array of [x,y])
+  x             Float      @default(0)
+  y             Float      @default(0)
+  width         Float      @default(80)
+  height        Float      @default(80)
+  rotation      Float      @default(0) // degrees
+  minPartySize  Int        @default(1) @map("min_party_size")
+  maxPartySize  Int?       @map("max_party_size") // null = falls back to capacity
+  revenueCenter String?    @map("revenue_center") @db.VarChar(50)
+  isBookable    Boolean    @default(true) @map("is_bookable")
+  zIndex        Int        @default(0) @map("z_index")
+
+  // Phase 4 (2026-05-18): live state for floor view (drives status colors,
+  // server-color fill, turn-time progress bar)
+  currentServerId    String?   @map("current_server_id") @db.Uuid
+  seatedAt           DateTime? @map("seated_at")
+  guestCount         Int?      @map("guest_count")
+  lastStatusChangeAt DateTime? @map("last_status_change_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  location           Location        @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  floorPlan          FloorPlan?      @relation(fields: [floorPlanId], references: [id], onDelete: SetNull)
+  section            Section?        @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+  orders             Order[]
+  sessions           TableSession[]
+  reservations       Reservation[]
+  waitlistSeatings   WaitlistEntry[]
+  // Phase 3c (2026-05-18): hotspots in 360° scenes that link to this table
+  tourHotspotTargets TourHotspot[]   @relation("HotspotTargetTable")
+  // Phase 4 (2026-05-18): current server (who's serving this table right now)
+  currentServer      Membership?     @relation("TableCurrentServer", fields: [currentServerId], references: [id], onDelete: SetNull)
+
+  @@unique([locationId, tableNumber])
+  @@index([locationId])
+  @@index([qrCode])
+  @@index([floorPlanId])
+  @@index([sectionId])
+  @@map("tables")
+}
+
+enum TableShape {
+  ROUND
+  SQUARE
+  RECTANGLE
+  BOOTH
+  BAR
+  CUSTOM
+}
+
+enum TableStatus {
+  AVAILABLE
+  OCCUPIED
+  RESERVED
+  CLEANING
+  BLOCKED
+}
+
+// Table Session - Tracks a dining session from arrival to payment
+model TableSession {
+  id         String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tableId    String        @map("table_id") @db.Uuid
+  locationId String        @map("location_id") @db.Uuid
+  status     SessionStatus @default(ACTIVE)
+  guestCount Int           @default(1) @map("guest_count")
+
+  // Session settings
+  allowGroupOrdering Boolean @default(true) @map("allow_group_ordering")
+  requireApproval    Boolean @default(false) @map("require_approval") // Host approves orders
+
+  // Timing
+  startedAt      DateTime  @default(now()) @map("started_at")
+  lastActivityAt DateTime  @default(now()) @map("last_activity_at")
+  endedAt        DateTime? @map("ended_at")
+
+  // Totals
+  totalSpent Int @default(0) @map("total_spent") // Running total in cents
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  table        Table           @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  location     Location        @relation(fields: [locationId], references: [id])
+  guests       TableGuest[]
+  orders       Order[]         @relation("SessionOrders")
+  requests     TableRequest[]
+  promptsShown SessionPrompt[]
+
+  @@index([tableId])
+  @@index([locationId])
+  @@index([status])
+  @@map("table_sessions")
+}
+
+enum SessionStatus {
+  ACTIVE // Guests at table
+  ORDERING // Currently placing order
+  DINING // Food served, eating
+  PAYMENT_PENDING // Waiting for payment
+  COMPLETED // Session ended
+  CANCELLED // Abandoned
+}
+
+// Table Guest - Individual person at a table
+model TableGuest {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId  String   @map("session_id") @db.Uuid
+  guestName  String?  @map("guest_name") @db.VarChar(100)
+  guestToken String   @unique @map("guest_token") @db.VarChar(100) // Browser token
+  isHost     Boolean  @default(false) @map("is_host")
+  joinedAt   DateTime @default(now()) @map("joined_at")
+
+  // Relations
+  session    TableSession    @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  cartItems  GuestCartItem[]
+  orderItems OrderItem[]     @relation("GuestOrderItems")
+
+  @@index([sessionId])
+  @@index([guestToken])
+  @@map("table_guests")
+}
+
+// Guest Cart Item - Items in a guest's cart before ordering
+model GuestCartItem {
+  id                  String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  guestId             String  @map("guest_id") @db.Uuid
+  productId           String  @map("product_id") @db.Uuid
+  variantId           String? @map("variant_id") @db.Uuid
+  quantity            Int     @default(1)
+  unitPrice           Int     @map("unit_price") // Price in cents
+  modifiers           Json? // [{modifierId, name, price, quantity}]
+  specialInstructions String? @map("special_instructions") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  guest   TableGuest @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  product Product    @relation(fields: [productId], references: [id])
+
+  @@index([guestId])
+  @@map("guest_cart_items")
+}
+
+// Table Request - Customer requests (water, help, bill)
+model TableRequest {
+  id        String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId String        @map("session_id") @db.Uuid
+  guestId   String?       @map("guest_id") @db.Uuid
+  type      RequestType
+  status    RequestStatus @default(PENDING)
+  note      String?       @db.VarChar(255)
+
+  createdAt      DateTime  @default(now()) @map("created_at")
+  acknowledgedAt DateTime? @map("acknowledged_at")
+  completedAt    DateTime? @map("completed_at")
+  respondedById  String?   @map("responded_by_id") @db.Uuid
+
+  // Relations
+  session TableSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([status])
+  @@map("table_requests")
+}
+
+enum RequestType {
+  WATER
+  HELP
+  BILL
+  REFILL
+  NAPKINS
+  CUSTOM
+}
+
+enum RequestStatus {
+  PENDING
+  ACKNOWLEDGED
+  COMPLETED
+  CANCELLED
+}
+
+// Bill Split for table ordering
+model BillSplit {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId   String    @map("order_id") @db.Uuid
+  splitType SplitType @map("split_type")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  order Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  items BillSplitItem[]
+
+  @@index([orderId])
+  @@map("bill_splits")
+}
+
+enum SplitType {
+  EQUAL // Divide total by guest count
+  BY_GUEST // Each pays for their own items
+  CUSTOM // Manual assignment
+  SINGLE // One person pays all
+}
+
+model BillSplitItem {
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  billSplitId String        @map("bill_split_id") @db.Uuid
+  guestId     String?       @map("guest_id") @db.Uuid
+  guestName   String?       @map("guest_name") @db.VarChar(100)
+  amount      Int // Amount in cents
+  tipAmount   Int           @default(0) @map("tip_amount")
+  status      PaymentStatus @default(PENDING)
+  paymentId   String?       @map("payment_id") @db.Uuid
+  paidAt      DateTime?     @map("paid_at")
+
+  // Relations
+  billSplit BillSplit @relation(fields: [billSplitId], references: [id], onDelete: Cascade)
+
+  @@index([billSplitId])
+  @@map("bill_split_items")
+}
+
+// ============================================
+// SECTION 9: ORDERS
+// ============================================
+
+model Order {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId  String  @map("location_id") @db.Uuid
+  createdById String? @map("created_by_id") @db.Uuid
+
+  // Order identification
+  orderNumber   String @map("order_number") @db.VarChar(50)
+  displayNumber Int    @map("display_number") // Short number for kitchen (1-999)
+
+  // Order type
+  orderType OrderType @default(DINE_IN) @map("order_type")
+  tableId   String?   @map("table_id") @db.Uuid // For DINE_IN
+
+  // Customer info (for takeaway/delivery)
+  customerName  String? @map("customer_name") @db.VarChar(255)
+  customerPhone String? @map("customer_phone") @db.VarChar(20)
+  customerEmail String? @map("customer_email") @db.VarChar(255)
+
+  // Delivery info
+  deliveryAddress String? @map("delivery_address") @db.Text
+  deliveryNotes   String? @map("delivery_notes") @db.Text
+
+  // Status
+  status OrderStatus @default(NEW)
+
+  // Amounts (all in cents)
+  subtotal        Int    @default(0)
+  taxAmount       Int    @default(0) @map("tax_amount")
+  tax2Amount      Int    @default(0) @map("tax2_amount")
+  discountAmount  Int    @default(0) @map("discount_amount")
+  // Card-processing surcharge applied when the customer paid with a
+  // non-cash method under SURCHARGE mode. Always >= 0. Cash discounts
+  // land in discountAmount with a note instead.
+  surchargeAmount Int    @default(0) @map("surcharge_amount")
+  tipAmount       Int    @default(0) @map("tip_amount")
+  total           Int    @default(0)
+  currency        String @default("CAD") @db.VarChar(3)
+
+  // Cost tracking (for profit calculation)
+  totalCost Int @default(0) @map("total_cost") // Sum of item costs
+
+  // Notes
+  notes String? @db.Text
+
+  // Payment tracking
+  paymentStatus    PaymentStatus @default(PENDING) @map("payment_status")
+  paymentMethod    String?       @map("payment_method") @db.VarChar(50)
+  paymentUrl       String?       @map("payment_url") @db.VarChar(500)
+  paymentQrData    String?       @map("payment_qr_data") @db.Text
+  paymentExpiresAt DateTime?     @map("payment_expires_at")
+
+  // Timestamps
+  confirmedAt DateTime? @map("confirmed_at")
+  completedAt DateTime? @map("completed_at")
+  cancelledAt DateTime? @map("cancelled_at")
+  paidAt      DateTime? @map("paid_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  // Offline sync
+  offlineId String?   @unique @map("offline_id") @db.VarChar(100)
+  syncedAt  DateTime? @map("synced_at")
+
+  // Table Session for digital waiter
+  sessionId String? @map("session_id") @db.Uuid
+
+  // Appointment fields (salon)
+  appointmentDate DateTime? @map("appointment_date") @db.Date
+  appointmentTime String?   @map("appointment_time") @db.VarChar(5) // "14:30" format
+
+  // Phase E R4 (2026-07-31): appointment reminder timestamps. Cron
+  // stamps each one when it fires the corresponding reminder — nulls =
+  // not yet sent. Mirrors the reservation reminder columns.
+  reminder24hSentAt DateTime? @map("reminder_24h_sent_at")
+  reminder12hSentAt DateTime? @map("reminder_12h_sent_at")
+  reminder4hSentAt  DateTime? @map("reminder_4h_sent_at")
+
+  // Relations
+  location             Location              @relation(fields: [locationId], references: [id])
+  createdBy            Membership?           @relation("CreatedByMember", fields: [createdById], references: [id])
+  table                Table?                @relation(fields: [tableId], references: [id])
+  session              TableSession?         @relation("SessionOrders", fields: [sessionId], references: [id])
+  items                OrderItem[]
+  payments             Payment[]
+  kitchenQueue         KitchenQueue[]
+  stockMovements       StockMovement[]
+  billSplits           BillSplit[]
+  // Gift card ledger entries created against this order (redemptions/refunds)
+  giftCardTransactions GiftCardTransaction[] @relation("OrderGiftCardTxns")
+  cashMovements        CashMovement[]        @relation("OrderCashMovements")
+  deliverectOrder      DeliverectOrder?      @relation("DeliverectOrder")
+
+  @@unique([locationId, orderNumber])
+  @@index([locationId, status])
+  @@index([createdAt])
+  @@index([status])
+  @@index([appointmentDate])
+  @@map("orders")
+}
+
+enum OrderType {
+  DINE_IN
+  TAKEAWAY
+  DELIVERY
+  APPOINTMENT
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT // Waiting for payment (UPFRONT table orders)
+  NEW // Just created
+  CONFIRMED // Confirmed, sent to kitchen
+  PREPARING // Kitchen is working on it
+  READY // Ready for pickup/serve
+  SERVED // Served to customer (dine-in)
+  PICKED_UP // Customer picked up (takeaway)
+  DELIVERED // Delivered (delivery)
+  COMPLETED // Fully completed
+  CANCELLED // Cancelled
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+// Order Items
+model OrderItem {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId   String  @map("order_id") @db.Uuid
+  productId String  @map("product_id") @db.Uuid
+  variantId String? @map("variant_id") @db.Uuid
+
+  // Item details (copied at time of order for historical accuracy)
+  productName String  @map("product_name") @db.VarChar(255)
+  variantName String? @map("variant_name") @db.VarChar(100)
+
+  // Quantity & Pricing
+  quantity       Int @default(1)
+  unitPrice      Int @map("unit_price") // Base price in cents
+  modifiersTotal Int @default(0) @map("modifiers_total") // Sum of modifier prices
+  itemTotal      Int @map("item_total") // (unitPrice + modifiersTotal) * quantity
+
+  // Cost (for profit tracking)
+  unitCost Int @default(0) @map("unit_cost") // Cost in cents
+
+  // Special instructions
+  specialInstructions String? @map("special_instructions") @db.Text
+
+  // Kitchen status
+  status          OrderItemStatus @default(PENDING)
+  sentToKitchenAt DateTime?       @map("sent_to_kitchen_at")
+  preparedAt      DateTime?       @map("prepared_at")
+
+  // Digital waiter - link to guest who ordered
+  guestId String? @map("guest_id") @db.Uuid
+
+  // Salon/Appointment scheduling
+  technicianId   String?   @map("technician_id") @db.Uuid
+  scheduledStart DateTime? @map("scheduled_start")
+  scheduledEnd   DateTime? @map("scheduled_end")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  order         Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product       Product             @relation(fields: [productId], references: [id])
+  variant       ProductVariant?     @relation(fields: [variantId], references: [id])
+  guest         TableGuest?         @relation("GuestOrderItems", fields: [guestId], references: [id])
+  technician    Membership?         @relation("TechnicianAssignments", fields: [technicianId], references: [id])
+  modifiers     OrderItemModifier[]
+  allergenNotes OrderItemAllergen[]
+  kitchenQueue  KitchenQueue[]
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([technicianId])
+  @@map("order_items")
+}
+
+enum OrderItemStatus {
+  PENDING // Not yet sent to kitchen
+  COOKING // Being prepared
+  READY // Ready to serve
+  SERVED // Served/delivered
+  CANCELLED // Cancelled
+}
+
+// Order Item Modifiers
+model OrderItemModifier {
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderItemId String @map("order_item_id") @db.Uuid
+  modifierId  String @map("modifier_id") @db.Uuid
+
+  // Copied at time of order
+  modifierName String @map("modifier_name") @db.VarChar(100)
+  price        Int // Price at time of order
+
+  // Relations
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  modifier  Modifier  @relation(fields: [modifierId], references: [id])
+
+  @@index([orderItemId])
+  @@map("order_item_modifiers")
+}
+
+// Order Item Allergen Notes (CRITICAL for kitchen)
+model OrderItemAllergen {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderItemId String  @map("order_item_id") @db.Uuid
+  allergenId  String  @map("allergen_id") @db.Uuid
+  note        String  @db.VarChar(255) // "NO NUTS - CUSTOMER ALLERGY"
+  isAllergy   Boolean @default(true) @map("is_allergy") // True = allergy, False = preference
+
+  // Relations
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  allergen  Allergen  @relation(fields: [allergenId], references: [id])
+
+  @@index([orderItemId])
+  @@map("order_item_allergens")
+}
+
+// ============================================
+// SECTION 10: PAYMENTS
+// ============================================
+
+model Payment {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId String @map("order_id") @db.Uuid
+
+  // Provider info
+  provider       String  @db.VarChar(50) // 'itip', 'cash', 'card', etc.
+  providerRef    String? @map("provider_ref") @db.VarChar(255)
+  providerStatus String? @map("provider_status") @db.VarChar(50)
+
+  // Payment details
+  amount   Int // in cents
+  currency String              @default("CAD") @db.VarChar(3)
+  status   PaymentRecordStatus @default(PENDING)
+  method   String?             @db.VarChar(50) // 'card', 'apple_pay', 'cash'
+
+  // Metadata
+  metadata      Json?
+  failureReason String? @map("failure_reason") @db.Text
+
+  // Timestamps
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  completedAt DateTime? @map("completed_at")
+
+  // Relations
+  order                Order                 @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  refunds              Refund[]
+  giftCardTransactions GiftCardTransaction[] @relation("PaymentGiftCardTxns")
+  cashMovements        CashMovement[]        @relation("PaymentCashMovements")
+
+  @@index([orderId])
+  @@index([providerRef])
+  @@index([status])
+  @@map("payments")
+}
+
+enum PaymentRecordStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Refund {
+  id            String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentId     String       @map("payment_id") @db.Uuid
+  amount        Int // in cents
+  reason        String?      @db.VarChar(255)
+  status        RefundStatus @default(PENDING)
+  providerRef   String?      @map("provider_ref") @db.VarChar(255)
+  initiatedById String?      @map("initiated_by_id") @db.Uuid
+  createdAt     DateTime     @default(now()) @map("created_at")
+  completedAt   DateTime?    @map("completed_at")
+
+  // Relations
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ============================================
+// SECTION 10b: GIFT CARDS
+// ============================================
+// Stored-value cards, digital (emailed code) or physical (printed).
+// Balance decrements as customers redeem against orders. Ledger table
+// keeps an audit trail of every issue / redeem / refund / adjustment.
+
+model GiftCard {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  code     String @db.VarChar(32)
+
+  type   GiftCardType   @default(DIGITAL)
+  status GiftCardStatus @default(ACTIVE)
+
+  initialAmount Int    @map("initial_amount") // cents
+  balance       Int // cents
+  currency      String @default("CAD") @db.VarChar(3)
+
+  recipientName  String? @map("recipient_name") @db.VarChar(255)
+  recipientEmail String? @map("recipient_email") @db.VarChar(255)
+  recipientPhone String? @map("recipient_phone") @db.VarChar(32)
+  senderName     String? @map("sender_name") @db.VarChar(255)
+  message        String? @db.Text
+
+  batchId String? @map("batch_id") @db.Uuid
+
+  issuedById      String?   @map("issued_by_id") @db.Uuid
+  issuedAt        DateTime  @default(now()) @map("issued_at")
+  expiresAt       DateTime? @map("expires_at")
+  cancelledAt     DateTime? @map("cancelled_at")
+  cancelledReason String?   @map("cancelled_reason") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  issuedBy     Membership?           @relation("GiftCardIssuedBy", fields: [issuedById], references: [id], onDelete: SetNull)
+  transactions GiftCardTransaction[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@index([tenantId, batchId])
+  @@index([recipientEmail])
+  @@map("gift_cards")
+}
+
+enum GiftCardType {
+  DIGITAL
+  PHYSICAL
+}
+
+enum GiftCardStatus {
+  ACTIVE
+  REDEEMED
+  EXPIRED
+  CANCELLED
+}
+
+model GiftCardTransaction {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  giftCardId String  @map("gift_card_id") @db.Uuid
+  orderId    String? @map("order_id") @db.Uuid
+  paymentId  String? @map("payment_id") @db.Uuid
+
+  type         GiftCardTxnType
+  amount       Int // signed cents: +credit / -debit
+  balanceAfter Int             @map("balance_after")
+
+  notes         String? @db.Text
+  performedById String? @map("performed_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  giftCard GiftCard @relation(fields: [giftCardId], references: [id], onDelete: Cascade)
+  order    Order?   @relation("OrderGiftCardTxns", fields: [orderId], references: [id], onDelete: SetNull)
+  payment  Payment? @relation("PaymentGiftCardTxns", fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([giftCardId, createdAt])
+  @@index([orderId])
+  @@map("gift_card_transactions")
+}
+
+enum GiftCardTxnType {
+  ISSUE
+  REDEEM
+  REFUND
+  ADJUSTMENT
+  CANCEL
+}
+
+// ============================================
+// SECTION 10c: CASH DRAWER SESSIONS
+// ============================================
+// One session per cashier shift (or per terminal, per day). Auto-logs
+// cash payments as PAYMENT movements; PAYOUT/PAYIN/DROP are entered
+// manually. Closing count vs expected reveals over/short.
+
+model CashDrawerSession {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId   String  @map("tenant_id") @db.Uuid
+  locationId String  @map("location_id") @db.Uuid
+  terminalId String? @map("terminal_id") @db.Uuid
+
+  status CashDrawerStatus @default(OPEN)
+
+  openingFloat Int      @map("opening_float") // cents
+  openingNote  String?  @map("opening_note") @db.Text
+  openedById   String?  @map("opened_by_id") @db.Uuid
+  openedAt     DateTime @default(now()) @map("opened_at")
+
+  closingCount Int?      @map("closing_count")
+  expectedCash Int?      @map("expected_cash")
+  variance     Int? // closingCount - expectedCash (± cents)
+  closingNote  String?   @map("closing_note") @db.Text
+  closedById   String?   @map("closed_by_id") @db.Uuid
+  closedAt     DateTime? @map("closed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location  Location       @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  terminal  Terminal?      @relation(fields: [terminalId], references: [id], onDelete: SetNull)
+  openedBy  Membership?    @relation("CashDrawerOpenedBy", fields: [openedById], references: [id], onDelete: SetNull)
+  closedBy  Membership?    @relation("CashDrawerClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  movements CashMovement[]
+
+  @@index([tenantId, status])
+  @@index([openedAt])
+  @@map("cash_drawer_sessions")
+}
+
+enum CashDrawerStatus {
+  OPEN
+  CLOSED
+}
+
+model CashMovement {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId String @map("session_id") @db.Uuid
+
+  type   CashMovementType
+  amount Int // signed cents: +in / -out
+
+  orderId   String? @map("order_id") @db.Uuid
+  paymentId String? @map("payment_id") @db.Uuid
+
+  reason        String? @db.Text
+  performedById String? @map("performed_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  session     CashDrawerSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  order       Order?            @relation("OrderCashMovements", fields: [orderId], references: [id], onDelete: SetNull)
+  payment     Payment?          @relation("PaymentCashMovements", fields: [paymentId], references: [id], onDelete: SetNull)
+  performedBy Membership?       @relation("CashMovementBy", fields: [performedById], references: [id], onDelete: SetNull)
+
+  @@index([sessionId, createdAt])
+  @@index([paymentId])
+  @@map("cash_movements")
+}
+
+enum CashMovementType {
+  OPENING
+  PAYMENT
+  REFUND
+  PAYOUT
+  PAYIN
+  DROP
+  CLOSING
+}
+
+// ============================================
+// SECTION 10d: EMPLOYEE TIME CLOCK
+// ============================================
+// One entry per shift (open at clock-in, closed at clock-out). Breaks
+// live in their own table so multi-break shifts are cleanly auditable.
+// total_minutes and break_minutes are stamped at close so timesheet
+// reports don't have to sum breaks on every read.
+
+model TimeClockEntry {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String @map("tenant_id") @db.Uuid
+  membershipId String @map("membership_id") @db.Uuid
+  locationId   String @map("location_id") @db.Uuid
+
+  status TimeClockStatus @default(ACTIVE)
+
+  clockedInAt  DateTime  @default(now()) @map("clocked_in_at")
+  clockedOutAt DateTime? @map("clocked_out_at")
+
+  totalMinutes Int? @map("total_minutes")
+  breakMinutes Int? @map("break_minutes")
+
+  notes String? @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant     Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  membership Membership       @relation("TimeClockEntries", fields: [membershipId], references: [id], onDelete: Cascade)
+  location   Location         @relation("TimeClockLocation", fields: [locationId], references: [id], onDelete: Cascade)
+  breaks     TimeClockBreak[]
+
+  @@index([tenantId, clockedInAt])
+  @@index([membershipId, clockedInAt])
+  @@map("time_clock_entries")
+}
+
+enum TimeClockStatus {
+  ACTIVE
+  ON_BREAK
+  CLOSED
+}
+
+model TimeClockBreak {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entryId String @map("entry_id") @db.Uuid
+
+  type TimeClockBreakType @default(REST)
+
+  startedAt DateTime  @default(now()) @map("started_at")
+  endedAt   DateTime? @map("ended_at")
+  minutes   Int?
+
+  notes String? @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  entry TimeClockEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@index([entryId, startedAt])
+  @@map("time_clock_breaks")
+}
+
+enum TimeClockBreakType {
+  MEAL
+  REST
+}
+
+// ============================================
+// SECTION 10e: TAX CATEGORIES + LOCATION OVERRIDES
+// ============================================
+// Product-level tax categories (Standard / Zero-rated / Reduced etc.)
+// with optional per-location rate overrides. Falls back to
+// TenantSettings.taxRate when a product has no category.
+
+model TaxCategory {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  name        String  @db.VarChar(100)
+  ratePercent Decimal @map("rate_percent") @db.Decimal(5, 2)
+  description String? @db.Text
+
+  isDefault Boolean @default(false) @map("is_default")
+  isActive  Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant            Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  products          Product[]
+  locationOverrides LocationTaxRate[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, isActive])
+  @@map("tax_categories")
+}
+
+// ============================================
+// SECTION 10f: TIP POOLS + DISTRIBUTION
+// ============================================
+// Pool tips over a shift period and redistribute to clocked-in staff by
+// hours, evenly, or by role weights. See migration file for lifecycle.
+
+model TipPool {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId   String @map("tenant_id") @db.Uuid
+  locationId String @map("location_id") @db.Uuid
+
+  status TipPoolStatus @default(OPEN)
+  rule   TipPoolRule   @default(BY_HOURS)
+
+  periodStart DateTime @map("period_start")
+  periodEnd   DateTime @map("period_end")
+
+  tipsCollected Int @default(0) @map("tips_collected")
+
+  // Snapshot of role weights when rule = BY_ROLE
+  roleWeights Json? @map("role_weights")
+
+  notes String? @db.Text
+
+  createdById String?   @map("created_by_id") @db.Uuid
+  closedById  String?   @map("closed_by_id") @db.Uuid
+  closedAt    DateTime? @map("closed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant        Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location      Location          @relation("TipPoolLocation", fields: [locationId], references: [id], onDelete: Cascade)
+  createdBy     Membership?       @relation("TipPoolCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  closedBy      Membership?       @relation("TipPoolClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  distributions TipDistribution[]
+
+  @@index([tenantId, periodStart])
+  @@index([locationId, periodStart])
+  @@index([tenantId, status])
+  @@map("tip_pools")
+}
+
+enum TipPoolStatus {
+  OPEN
+  DISTRIBUTED
+  CLOSED
+}
+
+enum TipPoolRule {
+  BY_HOURS
+  EVENLY
+  BY_ROLE
+}
+
+// ============================================
+// SECTION 10g: INTEGRATION CONNECTIONS
+// ============================================
+// OAuth-token storage for external accounting integrations. Currently
+// wired for QBO US + QBO CA (separate Intuit apps with different API
+// base URLs). Extensible to Xero / FreshBooks / Sage later.
+
+model IntegrationConnection {
+  id       String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String              @map("tenant_id") @db.Uuid
+  provider IntegrationProvider
+  status   IntegrationStatus   @default(DISCONNECTED)
+
+  // OAuth tokens — encrypted at rest via lib/integration-crypto.ts
+  accessTokenEnc     String?   @map("access_token_enc") @db.Text
+  refreshTokenEnc    String?   @map("refresh_token_enc") @db.Text
+  accessTokenExpires DateTime? @map("access_token_expires")
+
+  realmId     String? @map("realm_id") @db.VarChar(64)
+  companyName String? @map("company_name") @db.VarChar(255)
+
+  // Chart-of-Accounts mapping refs (QBO Account IDs — strings)
+  salesAccountRef     String? @map("sales_account_ref") @db.VarChar(64)
+  taxLiabilityRef     String? @map("tax_liability_ref") @db.VarChar(64)
+  tipsLiabilityRef    String? @map("tips_liability_ref") @db.VarChar(64)
+  discountsAccountRef String? @map("discounts_account_ref") @db.VarChar(64)
+  refundsAccountRef   String? @map("refunds_account_ref") @db.VarChar(64)
+  cashAccountRef      String? @map("cash_account_ref") @db.VarChar(64)
+  cardAccountRef      String? @map("card_account_ref") @db.VarChar(64)
+
+  // Deliverect-specific — merchant's Deliverect location id + API creds +
+  // per-connection webhook secret for HMAC verification. Kept alongside
+  // the QBO fields so we don't need one integration table per provider.
+  externalLocationId String? @map("external_location_id") @db.VarChar(64)
+  webhookSecretEnc   String? @map("webhook_secret_enc") @db.Text
+  apiKeyEnc          String? @map("api_key_enc") @db.Text
+  apiSecretEnc       String? @map("api_secret_enc") @db.Text
+
+  lastSyncAt  DateTime? @map("last_sync_at")
+  lastError   String?   @map("last_error") @db.Text
+  lastErrorAt DateTime? @map("last_error_at")
+
+  connectedById String?   @map("connected_by_id") @db.Uuid
+  connectedAt   DateTime? @map("connected_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant           Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  connectedBy      Membership?          @relation("IntegrationConnectedBy", fields: [connectedById], references: [id], onDelete: SetNull)
+  syncLogs         IntegrationSyncLog[]
+  deliverectOrders DeliverectOrder[]
+
+  @@unique([tenantId, provider])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([externalLocationId])
+  @@map("integration_connections")
+}
+
+// Deliverect-inbound order provenance. One row per delivery-aggregator
+// order we've received via the webhook. `externalOrderId` is the
+// idempotency key — a retried webhook maps to the same Order row.
+model DeliverectOrder {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  connectionId String @map("connection_id") @db.Uuid
+  // @unique required for the one-to-one back-relation on Order — every
+  // delivery order maps to exactly one iTAP Order row and vice versa.
+  orderId      String @unique @map("order_id") @db.Uuid
+
+  externalOrderId    String  @map("external_order_id") @db.VarChar(128)
+  channel            String  @db.VarChar(50) // 'doordash' | 'uber_eats' | 'skip'
+  channelOrderNumber String? @map("channel_order_number") @db.VarChar(64)
+  rawPayload         Json    @map("raw_payload")
+
+  receivedAt DateTime @default(now()) @map("received_at")
+
+  connection IntegrationConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  order      Order                 @relation("DeliverectOrder", fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, externalOrderId])
+  @@index([channel, receivedAt])
+  @@map("deliverect_orders")
+}
+
+enum IntegrationProvider {
+  QUICKBOOKS_US
+  QUICKBOOKS_CA
+  DELIVERECT
+}
+
+enum IntegrationStatus {
+  DISCONNECTED
+  CONNECTED
+  ERROR
+  REVOKED
+}
+
+model IntegrationSyncLog {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  connectionId String @map("connection_id") @db.Uuid
+
+  businessDate DateTime @map("business_date") @db.Date
+  dryRun       Boolean  @default(false) @map("dry_run")
+  success      Boolean  @default(false)
+
+  payload  Json
+  response Json?
+  error    String? @db.Text
+
+  externalRef String? @map("external_ref") @db.VarChar(64)
+
+  performedById String?  @map("performed_by_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  connection IntegrationConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId, businessDate])
+  @@index([connectionId, success, businessDate])
+  @@map("integration_sync_log")
+}
+
+model TipDistribution {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  poolId       String @map("pool_id") @db.Uuid
+  membershipId String @map("membership_id") @db.Uuid
+
+  hoursWorked Decimal @default(0) @map("hours_worked") @db.Decimal(6, 2)
+  role        String  @db.VarChar(30)
+  weight      Decimal @default(0) @db.Decimal(6, 2)
+
+  shareAmount Int @map("share_amount")
+
+  notes String? @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  pool       TipPool    @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  membership Membership @relation("TipDistributionMember", fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@unique([poolId, membershipId])
+  @@index([membershipId, createdAt])
+  @@map("tip_distributions")
+}
+
+model LocationTaxRate {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId    String @map("location_id") @db.Uuid
+  taxCategoryId String @map("tax_category_id") @db.Uuid
+
+  ratePercent Decimal @map("rate_percent") @db.Decimal(5, 2)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  location    Location    @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  taxCategory TaxCategory @relation(fields: [taxCategoryId], references: [id], onDelete: Cascade)
+
+  @@unique([locationId, taxCategoryId])
+  @@index([locationId])
+  @@index([taxCategoryId])
+  @@map("location_tax_rates")
+}
+
+// ============================================
+// SECTION 11: KITCHEN DISPLAY SYSTEM
+// ============================================
+
+// Kitchen Stations
+model KitchenStation {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId   String   @map("location_id") @db.Uuid
+  name         String   @db.VarChar(100) // "Grill", "Fryer", "Drinks", "Desserts"
+  displayOrder Int      @default(0) @map("display_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  location        Location         @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  stationProducts StationProduct[]
+  kitchenQueue    KitchenQueue[]
+
+  @@index([locationId])
+  @@map("kitchen_stations")
+}
+
+// Link Products to Stations (which station prepares which product)
+model StationProduct {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  stationId String @map("station_id") @db.Uuid
+  productId String @map("product_id") @db.Uuid
+
+  // Relations
+  station KitchenStation @relation(fields: [stationId], references: [id], onDelete: Cascade)
+  product Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([stationId, productId])
+  @@map("station_products")
+}
+
+// Kitchen Queue - Live order items for kitchen display
+model KitchenQueue {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId     String  @map("order_id") @db.Uuid
+  orderItemId String  @map("order_item_id") @db.Uuid
+  stationId   String? @map("station_id") @db.Uuid // Null = default station
+
+  status   KitchenQueueStatus @default(PENDING)
+  priority Int                @default(0) // Higher = more urgent
+
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  updatedById String?   @map("updated_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  order     Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem OrderItem       @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  station   KitchenStation? @relation(fields: [stationId], references: [id])
+  updatedBy Membership?     @relation("KitchenUpdatedBy", fields: [updatedById], references: [id])
+
+  @@index([stationId, status])
+  @@index([orderId])
+  @@index([status])
+  @@map("kitchen_queue")
+}
+
+enum KitchenQueueStatus {
+  PENDING // Waiting to be started
+  IN_PROGRESS // Being prepared
+  READY // Done, waiting to be served
+  SERVED // Picked up / served
+  CANCELLED // Cancelled
+}
+
+// ============================================
+// SECTION 12: LOGS & AUDIT
+// ============================================
+
+model WebhookLog {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider    String    @db.VarChar(50)
+  eventType   String    @map("event_type") @db.VarChar(100)
+  payload     Json
+  status      String    @default("received") @db.VarChar(20)
+  error       String?   @db.Text
+  processedAt DateTime? @map("processed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([provider, eventType])
+  @@index([createdAt])
+  @@map("webhook_logs")
+}
+
+// Offline Sync Queue
+model SyncQueue {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String    @map("tenant_id") @db.Uuid
+  entityType  String    @map("entity_type") @db.VarChar(50)
+  entityId    String    @map("entity_id") @db.VarChar(100)
+  action      String    @db.VarChar(20)
+  payload     Json
+  status      String    @default("pending") @db.VarChar(20)
+  retries     Int       @default(0)
+  error       String?   @db.Text
+  createdAt   DateTime  @default(now()) @map("created_at")
+  processedAt DateTime? @map("processed_at")
+
+  @@index([tenantId, status])
+  @@index([createdAt])
+  @@map("sync_queue")
+}
+
+// ============================================
+// SECTION 13: SMART DIGITAL WAITER ENGINE
+// ============================================
+
+// Upsell Rules - Owner-defined suggestions
+model UpsellRule {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String  @map("tenant_id") @db.Uuid
+  name        String  @db.VarChar(100)
+  description String? @db.VarChar(500)
+  isActive    Boolean @default(true) @map("is_active")
+  priority    Int     @default(0) // Higher = shown first
+
+  // Trigger conditions
+  triggerType         UpsellTriggerType @map("trigger_type")
+  triggerProducts     String[]          @map("trigger_products") // Product IDs that trigger this
+  triggerCategories   String[]          @map("trigger_categories") // Category IDs that trigger this
+  triggerMinCartValue Int?              @map("trigger_min_cart_value") // Minimum cart value to trigger
+  triggerMaxCartValue Int?              @map("trigger_max_cart_value") // Don't upsell high spenders
+
+  // Time conditions
+  activeStartTime String? @map("active_start_time") @db.VarChar(5) // "11:00"
+  activeEndTime   String? @map("active_end_time") @db.VarChar(5) // "14:00"
+  activeDays      Int[]   @map("active_days") // [1,2,3,4,5] Mon-Fri
+
+  // What to suggest
+  suggestProducts   String[] @map("suggest_products") // Product IDs to suggest
+  suggestCategories String[] @map("suggest_categories") // Show from these categories
+  suggestMessage    String?  @map("suggest_message") @db.VarChar(255)
+  suggestDiscount   Int?     @map("suggest_discount") // Optional discount percentage
+
+  // Display settings
+  displayType  UpsellDisplayType @default(MODAL) @map("display_type")
+  displayImage String?           @map("display_image") @db.VarChar(500)
+
+  // Analytics
+  impressions Int @default(0)
+  acceptances Int @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([isActive])
+  @@map("upsell_rules")
+}
+
+enum UpsellTriggerType {
+  PRODUCT_ADDED // When specific product added to cart
+  CATEGORY_ADDED // When product from category added
+  CART_VALUE // When cart reaches certain value
+  CHECKOUT // At checkout
+  POST_ORDER // After order submitted
+  TIME_BASED // After X minutes at table
+}
+
+enum UpsellDisplayType {
+  MODAL // Full modal popup
+  BANNER // Top/bottom banner
+  INLINE // Inline suggestion
+  TOAST // Quick toast notification
+}
+
+// Smart Prompts - Time-based suggestions
+model SmartPrompt {
+  id       String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String  @map("tenant_id") @db.Uuid
+  name     String  @db.VarChar(100)
+  isActive Boolean @default(true) @map("is_active")
+
+  // Timing trigger
+  triggerType    PromptTriggerType @map("trigger_type")
+  triggerMinutes Int?              @map("trigger_minutes") // Minutes after event
+
+  // Conditions
+  requireMainCourse    Boolean @default(false) @map("require_main_course")
+  requireNoRecentOrder Boolean @default(false) @map("require_no_recent_order")
+  minSessionDuration   Int?    @map("min_session_duration") // Minimum minutes at table
+
+  // What to prompt
+  promptType     PromptType @map("prompt_type")
+  promptMessage  String     @map("prompt_message") @db.VarChar(255)
+  promptProducts String[]   @map("prompt_products") // Optional product suggestions
+
+  // Analytics
+  timesShown    Int @default(0) @map("times_shown")
+  timesAccepted Int @default(0) @map("times_accepted")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("smart_prompts")
+}
+
+enum PromptTriggerType {
+  SESSION_DURATION // X minutes after arrival
+  POST_MAIN_COURSE // X minutes after main course ordered
+  INACTIVITY // X minutes of no orders
+  SCHEDULED // At specific times
+}
+
+enum PromptType {
+  DRINKS_REFILL
+  DESSERT_SUGGESTION
+  BILL_READY
+  FEEDBACK_REQUEST
+  CUSTOM
+}
+
+// Session Prompt - Track which prompts shown to which session
+model SessionPrompt {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId   String    @map("session_id") @db.Uuid
+  promptId    String    @map("prompt_id") @db.Uuid
+  shownAt     DateTime  @default(now()) @map("shown_at")
+  acceptedAt  DateTime? @map("accepted_at")
+  dismissedAt DateTime? @map("dismissed_at")
+
+  // Relations
+  session TableSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("session_prompts")
+}
+
+// Promotions - Context-aware offers
+model Promotion {
+  id       String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String  @map("tenant_id") @db.Uuid
+  name     String  @db.VarChar(100)
+  code     String? @db.VarChar(50) // Optional promo code
+  isActive Boolean @default(true) @map("is_active")
+
+  // Discount
+  discountType  DiscountType @map("discount_type")
+  discountValue Int          @map("discount_value") // Percentage or fixed amount
+  maxDiscount   Int?         @map("max_discount") // Cap for percentage discounts
+
+  // Conditions
+  minCartValue         Int?     @map("min_cart_value")
+  minGuestCount        Int?     @map("min_guest_count") // Table size
+  applicableProducts   String[] @map("applicable_products")
+  applicableCategories String[] @map("applicable_categories")
+
+  // Time conditions
+  startDate       DateTime? @map("start_date")
+  endDate         DateTime? @map("end_date")
+  activeStartTime String?   @map("active_start_time") @db.VarChar(5)
+  activeEndTime   String?   @map("active_end_time") @db.VarChar(5)
+  activeDays      Int[]     @map("active_days")
+
+  // Triggers
+  autoApply         Boolean @default(false) @map("auto_apply")
+  triggerConditions Json?   @map("trigger_conditions") // Complex rules
+
+  // Limits
+  usageLimit       Int? @map("usage_limit")
+  usageCount       Int  @default(0) @map("usage_count")
+  perCustomerLimit Int? @map("per_customer_limit")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([isActive])
+  @@index([code])
+  @@map("promotions")
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  FREE_ITEM
+  BOGO // Buy one get one
+}
+
+// ============================================
+// SECTION 14: KITCHEN INTELLIGENCE
+// ============================================
+
+// Kitchen Load Rules - Protect kitchen from overload
+model KitchenLoadRule {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId   String @map("tenant_id") @db.Uuid
+  locationId String @unique @map("location_id") @db.Uuid
+
+  // Thresholds
+  maxActiveOrders Int @default(20) @map("max_active_orders")
+  maxItemsInQueue Int @default(50) @map("max_items_in_queue")
+
+  // Actions when overloaded
+  pausePromotions Boolean @default(true) @map("pause_promotions")
+  hideSlowItems   Boolean @default(false) @map("hide_slow_items")
+  showWaitTime    Boolean @default(true) @map("show_wait_time")
+  customMessage   String? @map("custom_message") @db.VarChar(255)
+
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id])
+
+  @@index([tenantId])
+  @@map("kitchen_load_rules")
+}
+
+// ============================================
+// SECTION 15: LOYALTY & REWARDS
+// ============================================
+
+// Loyalty Program
+model LoyaltyProgram {
+  id       String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String  @unique @map("tenant_id") @db.Uuid
+  name     String  @db.VarChar(100)
+  isActive Boolean @default(true) @map("is_active")
+
+  // Point system
+  pointsPerDollar Int @default(1) @map("points_per_dollar")
+  pointsPerVisit  Int @default(0) @map("points_per_visit")
+
+  // Streak bonuses
+  streakEnabled Boolean @default(false) @map("streak_enabled")
+  streakDays    Int     @default(7) @map("streak_days")
+  streakBonus   Int     @default(50) @map("streak_bonus") // Bonus points
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant          Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  rewards         LoyaltyReward[]
+  customers       CustomerLoyalty[]
+  spinWheelPrizes SpinWheelPrize[]
+
+  @@map("loyalty_programs")
+}
+
+// Loyalty Rewards
+model LoyaltyReward {
+  id             String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  programId      String     @map("program_id") @db.Uuid
+  name           String     @db.VarChar(100)
+  description    String?    @db.VarChar(255)
+  pointsRequired Int        @map("points_required")
+  rewardType     RewardType @map("reward_type")
+  rewardValue    Int        @map("reward_value") // Discount amount or product ID ref
+  productId      String?    @map("product_id") @db.Uuid // For FREE_PRODUCT
+  isActive       Boolean    @default(true) @map("is_active")
+  sortOrder      Int        @default(0) @map("sort_order")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  program     LoyaltyProgram     @relation(fields: [programId], references: [id], onDelete: Cascade)
+  redemptions RewardRedemption[]
+
+  @@index([programId])
+  @@map("loyalty_rewards")
+}
+
+enum RewardType {
+  DISCOUNT_PERCENTAGE
+  DISCOUNT_FIXED
+  FREE_PRODUCT
+  SPIN_WHEEL
+  MYSTERY_REWARD
+}
+
+// Customer Loyalty - Track customer points
+model CustomerLoyalty {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  programId  String  @map("program_id") @db.Uuid
+  email      String? @db.VarChar(255)
+  phone      String? @db.VarChar(20)
+  guestToken String? @map("guest_token") @db.VarChar(100) // Anonymous tracking
+
+  totalPoints    Int       @default(0) @map("total_points")
+  lifetimePoints Int       @default(0) @map("lifetime_points")
+  visitCount     Int       @default(0) @map("visit_count")
+  totalSpent     Int       @default(0) @map("total_spent") // Lifetime spend in cents
+  lastVisit      DateTime? @map("last_visit")
+
+  // Streak tracking
+  currentStreak  Int       @default(0) @map("current_streak")
+  longestStreak  Int       @default(0) @map("longest_streak")
+  lastStreakDate DateTime? @map("last_streak_date")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  program       LoyaltyProgram     @relation(fields: [programId], references: [id], onDelete: Cascade)
+  redemptions   RewardRedemption[]
+  pointsHistory PointsHistory[]
+
+  @@index([programId])
+  @@index([email])
+  @@index([phone])
+  @@map("customer_loyalty")
+}
+
+// Points History - Track point transactions
+model PointsHistory {
+  id          String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId  String     @map("customer_id") @db.Uuid
+  points      Int // Positive for earn, negative for redeem
+  type        PointsType
+  description String?    @db.VarChar(255)
+  orderId     String?    @map("order_id") @db.Uuid
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  // Relations
+  customer CustomerLoyalty @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+  @@map("points_history")
+}
+
+enum PointsType {
+  PURCHASE // Points earned from purchase
+  VISIT // Points for visiting
+  STREAK_BONUS // Streak bonus points
+  REFERRAL // Referral bonus
+  REDEMPTION // Points used for reward
+  ADJUSTMENT // Manual adjustment
+  EXPIRED // Points expired
+}
+
+// Reward Redemption - Track reward usage
+model RewardRedemption {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId String   @map("customer_id") @db.Uuid
+  rewardId   String   @map("reward_id") @db.Uuid
+  pointsUsed Int      @map("points_used")
+  orderId    String?  @map("order_id") @db.Uuid
+  redeemedAt DateTime @default(now()) @map("redeemed_at")
+
+  // Relations
+  customer CustomerLoyalty @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  reward   LoyaltyReward   @relation(fields: [rewardId], references: [id])
+
+  @@index([customerId])
+  @@map("reward_redemptions")
+}
+
+// Spin Wheel Prizes
+model SpinWheelPrize {
+  id          String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  programId   String     @map("program_id") @db.Uuid
+  name        String     @db.VarChar(100)
+  probability Int // Percentage chance (all should sum to 100)
+  prizeType   RewardType @map("prize_type")
+  prizeValue  Int        @map("prize_value")
+  color       String?    @db.VarChar(7) // Hex color for wheel
+  isActive    Boolean    @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  program LoyaltyProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  @@index([programId])
+  @@map("spin_wheel_prizes")
+}
+
+// ============================================
+// SECTION 16: STAFF NOTIFICATIONS
+// ============================================
+
+model StaffNotification {
+  id         String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId String               @map("location_id") @db.Uuid
+  type       NotificationType
+  title      String               @db.VarChar(100)
+  message    String               @db.VarChar(500)
+  priority   NotificationPriority @default(NORMAL)
+
+  // References
+  tableId   String? @map("table_id") @db.Uuid
+  orderId   String? @map("order_id") @db.Uuid
+  requestId String? @map("request_id") @db.Uuid
+  sessionId String? @map("session_id") @db.Uuid
+
+  status      NotificationStatus @default(UNREAD)
+  targetRoles String[]           @map("target_roles") // ["POS_STAFF", "KITCHEN_STAFF"]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  readAt    DateTime? @map("read_at")
+  readById  String?   @map("read_by_id") @db.Uuid
+
+  // Relations
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([locationId])
+  @@index([status])
+  @@index([type])
+  @@map("staff_notifications")
+}
+
+enum NotificationType {
+  TABLE_REQUEST // Customer needs help
+  ORDER_READY // Kitchen completed order
+  KITCHEN_DELAY // Order is delayed
+  PAYMENT_RECEIVED // Payment completed
+  NEW_ORDER // New order placed
+  LOW_STOCK // Inventory alert
+  SESSION_LONG // Table has been occupied too long
+  CUSTOM
+}
+
+enum NotificationPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum NotificationStatus {
+  UNREAD
+  READ
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+// ============================================
+// SECTION 17: PAYMENT TERMINALS (Global Payments UPA)
+// ============================================
+
+model Terminal {
+  id           String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId   String         @map("location_id") @db.Uuid
+  name         String         @db.VarChar(100)
+  // ipAddress + port are only used by legacy UPA (TCP) terminals. UCI
+  // terminals reach us through Global Payments' cloud, so they don't have
+  // a local IP — the DB was migrated to nullable in 017_terminals_uci.sql
+  // but the Prisma schema was left out of sync until now.
+  ipAddress    String?        @map("ip_address") @db.VarChar(45)
+  port         Int?           @default(8081)
+  serialNumber String?        @map("serial_number") @db.VarChar(100)
+  model        String?        @db.VarChar(100)
+  status       TerminalStatus @default(OFFLINE)
+  isDefault    Boolean        @default(false) @map("is_default")
+  lastPingAt   DateTime?      @map("last_ping_at")
+  lastEodAt    DateTime?      @map("last_eod_at")
+  ecrId        String         @default("13") @map("ecr_id") @db.VarChar(10)
+  metadata     Json?
+
+  // UCI (Global Payments cloud) — added in 017_terminals_uci.sql
+  provider       String  @default("UCI") @db.VarChar(20)
+  uciLane        String? @map("uci_lane") @db.VarChar(50)
+  uciMerchantId  String? @map("uci_merchant_id") @db.VarChar(50)
+  uciEnvironment String? @default("CERT") @map("uci_environment") @db.VarChar(10)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  location           Location              @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  transactions       TerminalTransaction[]
+  cashDrawerSessions CashDrawerSession[]
+
+  // Old (locationId, ipAddress, port) unique constraint was DROPPED in
+  // 017_terminals_uci.sql — replaced with two partial unique indexes
+  // (one for UCI on uci_lane, one for UPA on ip_address+port). Prisma
+  // can't express partial indexes, so we just index locationId here and
+  // trust the DB-level constraints.
+  @@index([locationId])
+  @@index([uciLane])
+  @@map("terminals")
+}
+
+enum TerminalStatus {
+  ONLINE
+  OFFLINE
+  BUSY
+  ERROR
+}
+
+model TerminalTransaction {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  terminalId String  @map("terminal_id") @db.Uuid
+  orderId    String? @map("order_id") @db.Uuid
+  paymentId  String? @map("payment_id") @db.Uuid
+
+  command         String  @db.VarChar(50)
+  transactionType String? @map("transaction_type") @db.VarChar(20)
+  requestId       String  @map("request_id") @db.VarChar(50)
+  requestPayload  Json    @map("request_payload")
+  responsePayload Json?   @map("response_payload")
+
+  amount    Int?
+  tipAmount Int?   @map("tip_amount")
+  currency  String @default("CAD") @db.VarChar(3)
+
+  result       String? @db.VarChar(20)
+  errorCode    String? @map("error_code") @db.VarChar(20)
+  errorMessage String? @map("error_message") @db.Text
+
+  referenceNumber String? @map("reference_number") @db.VarChar(50)
+  transactionId   String? @map("gp_transaction_id") @db.VarChar(50)
+  authCode        String? @map("auth_code") @db.VarChar(20)
+  cardType        String? @map("card_type") @db.VarChar(20)
+  maskedPan       String? @map("masked_pan") @db.VarChar(20)
+  entryMode       String? @map("entry_mode") @db.VarChar(20)
+
+  status      TerminalTxStatus @default(SENT)
+  sentAt      DateTime         @default(now()) @map("sent_at")
+  respondedAt DateTime?        @map("responded_at")
+
+  // Relations
+  terminal Terminal @relation(fields: [terminalId], references: [id], onDelete: Cascade)
+
+  @@index([terminalId])
+  @@index([orderId])
+  @@index([referenceNumber])
+  @@index([requestId])
+  @@map("terminal_transactions")
+}
+
+enum TerminalTxStatus {
+  SENT
+  SUCCESS
+  FAILED
+  CANCELLED
+  TIMEOUT
+}
+
+// ============================================================================
+// SECTION 14: FLOOR PLAN + RESERVATIONS + UPLOADS  (Phase 1, 2026-05-18)
+// ============================================================================
+//
+// Floor plans live PER LOCATION. A location can have multiple floor plans
+// (Main Dining, Patio, Mezzanine). Each floor plan has Sections (Bar, VIP)
+// and Tables (extended from existing tables table with x/y/shape fields).
+//
+// Reservations are independent records that bind to a table only at the
+// moment of seating (Toast pattern — keeps host flexible).
+//
+// UploadedFile tracks S3 objects per-tenant with strict isolation (DB
+// trigger enforces s3_key MUST start with tenant_id/).
+
+model FloorPlan {
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId   String  @map("location_id") @db.Uuid
+  name         String  @db.VarChar(100)
+  floorNumber  Int     @default(1) @map("floor_number")
+  displayOrder Int     @default(0) @map("display_order")
+  description  String? @db.Text
+
+  // Canvas (logical units, not pixels)
+  canvasWidth       Int     @default(1200) @map("canvas_width")
+  canvasHeight      Int     @default(800) @map("canvas_height")
+  gridSize          Int     @default(20) @map("grid_size")
+  backgroundUrl     String? @map("background_url") @db.VarChar(500)
+  backgroundOpacity Float   @default(0.5) @map("background_opacity")
+
+  // Versioning
+  currentVersion    Int     @default(1) @map("current_version")
+  layoutJson        Json    @default("{}") @map("layout_json")
+  draftJson         Json?   @map("draft_json")
+  hasUnsavedChanges Boolean @default(false) @map("has_unsaved_changes")
+
+  isActive  Boolean @default(true) @map("is_active")
+  isDefault Boolean @default(false) @map("is_default")
+
+  publishedAt   DateTime? @map("published_at")
+  publishedById String?   @map("published_by") @db.Uuid
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  location    Location           @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  publishedBy Membership?        @relation("FloorPlanPublishedBy", fields: [publishedById], references: [id], onDelete: SetNull)
+  sections    Section[]
+  tables      Table[]
+  versions    FloorPlanVersion[]
+
+  @@index([locationId])
+  @@index([locationId, isActive], name: "idx_floor_plans_active")
+  @@map("floor_plans")
+}
+
+model FloorPlanVersion {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  floorPlanId   String   @map("floor_plan_id") @db.Uuid
+  versionNumber Int      @map("version_number")
+  layoutJson    Json     @map("layout_json")
+  note          String?  @db.Text
+  savedAt       DateTime @default(now()) @map("saved_at")
+  savedById     String?  @map("saved_by_id") @db.Uuid
+
+  // Relations
+  floorPlan FloorPlan   @relation(fields: [floorPlanId], references: [id], onDelete: Cascade)
+  savedBy   Membership? @relation("FloorPlanVersionSavedBy", fields: [savedById], references: [id], onDelete: SetNull)
+
+  @@unique([floorPlanId, versionNumber])
+  @@index([floorPlanId, versionNumber(sort: Desc)])
+  @@map("floor_plan_versions")
+}
+
+model Section {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  floorPlanId   String   @map("floor_plan_id") @db.Uuid
+  name          String   @db.VarChar(100)
+  color         String   @default("#3B82F6") @db.VarChar(7)
+  displayOrder  Int      @default(0) @map("display_order")
+  polygonJson   Json?    @map("polygon_json")
+  revenueCenter String?  @map("revenue_center") @db.VarChar(50)
+  minPartySize  Int?     @map("min_party_size")
+  maxPartySize  Int?     @map("max_party_size")
+  isBookable    Boolean  @default(true) @map("is_bookable")
+  description   String?  @db.Text
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  floorPlan               FloorPlan                 @relation(fields: [floorPlanId], references: [id], onDelete: Cascade)
+  tables                  Table[]
+  guestProfilePreferences GuestProfile[]            @relation("GuestPreferredSection")
+  waitlistPreferences     WaitlistEntry[]
+  serverAssignments       ServerSectionAssignment[]
+  mediaItems              MediaItem[]
+
+  @@index([floorPlanId, displayOrder])
+  @@map("sections")
+}
+
+model GuestProfile {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  // Identity
+  email     String? @db.VarChar(255)
+  phone     String? @db.VarChar(30)
+  firstName String  @map("first_name") @db.VarChar(100)
+  lastName  String? @map("last_name") @db.VarChar(100)
+
+  // Visit history
+  visitCount        Int       @default(0) @map("visit_count")
+  lastVisitAt       DateTime? @map("last_visit_at")
+  firstVisitAt      DateTime? @map("first_visit_at")
+  lifetimeSpend     Int       @default(0) @map("lifetime_spend") // cents
+  averageSpend      Int       @default(0) @map("average_spend") // cents
+  noShowCount       Int       @default(0) @map("no_show_count")
+  cancellationCount Int       @default(0) @map("cancellation_count")
+
+  // Preferences
+  favoriteServerId    String?  @map("favorite_server_id") @db.Uuid
+  preferredSectionId  String?  @map("preferred_section_id") @db.Uuid
+  dietaryRestrictions String[] @map("dietary_restrictions") @db.VarChar(255)
+  allergies           String[] @db.VarChar(255)
+  alcoholPreferences  String[] @map("alcohol_preferences") @db.VarChar(255)
+  specialOccasions    Json?    @map("special_occasions")
+  notes               String?  @db.Text
+  tags                String[] @default([]) @db.VarChar(50)
+  vipTier             Int      @default(0) @map("vip_tier")
+
+  // Marketing opt-ins
+  optInMarketing Boolean @default(false) @map("opt_in_marketing")
+  optInWhatsapp  Boolean @default(false) @map("opt_in_whatsapp")
+  optInSms       Boolean @default(false) @map("opt_in_sms")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant           Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  favoriteServer   Membership?         @relation("GuestFavoriteServer", fields: [favoriteServerId], references: [id], onDelete: SetNull)
+  preferredSection Section?            @relation("GuestPreferredSection", fields: [preferredSectionId], references: [id], onDelete: SetNull)
+  reservations     Reservation[]
+  waitlistEntries  WaitlistEntry[]
+  arrivalEvents    GuestArrivalEvent[]
+
+  @@index([tenantId, lastVisitAt(sort: Desc)])
+  @@index([tenantId, visitCount(sort: Desc)])
+  @@map("guest_profiles")
+}
+
+model Reservation {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId     String  @map("location_id") @db.Uuid
+  tableId        String? @map("table_id") @db.Uuid
+  guestProfileId String? @map("guest_profile_id") @db.Uuid
+
+  // Snapshot
+  customerName  String  @map("customer_name") @db.VarChar(200)
+  customerPhone String? @map("customer_phone") @db.VarChar(30)
+  customerEmail String? @map("customer_email") @db.VarChar(255)
+  partySize     Int     @map("party_size")
+
+  // Time
+  bookedFor                DateTime  @map("booked_for")
+  estimatedDurationMinutes Int       @default(90) @map("estimated_duration_minutes")
+  holdExpiresAt            DateTime? @map("hold_expires_at")
+
+  // Status
+  status ReservationStatus @default(CONFIRMED)
+  source ReservationSource @default(WEBSITE)
+
+  // Context
+  specialOccasion String?  @map("special_occasion") @db.VarChar(50)
+  notes           String?  @db.Text
+  internalNotes   String?  @map("internal_notes") @db.Text
+  guestTags       String[] @default([]) @map("guest_tags") @db.VarChar(50)
+
+  // Money
+  depositAmount          Int?    @map("deposit_amount")
+  depositStatus          String? @map("deposit_status") @db.VarChar(20)
+  depositPaymentId       String? @map("deposit_payment_id") @db.VarChar(100)
+  cancellationFeeAmount  Int?    @map("cancellation_fee_amount")
+  cancellationFeeCharged Boolean @default(false) @map("cancellation_fee_charged")
+  cardOnFileToken        String? @map("card_on_file_token") @db.VarChar(255)
+
+  // Communications
+  confirmationSentAt DateTime? @map("confirmation_sent_at")
+  reminderSentAt     DateTime? @map("reminder_sent_at")
+  // Phase 5d (2026-05-18): split reminder tracking for 24h vs 2h windows
+  reminder24hSentAt  DateTime? @map("reminder_24h_sent_at")
+  reminder2hSentAt   DateTime? @map("reminder_2h_sent_at")
+  // Phase E R4 (2026-07-31): align on 24h/12h/4h across appointments +
+  // reservations. Legacy 2h column above stays for backfill compat.
+  reminder12hSentAt  DateTime? @map("reminder_12h_sent_at")
+  reminder4hSentAt   DateTime? @map("reminder_4h_sent_at")
+  whatsappThreadId   String?   @map("whatsapp_thread_id") @db.VarChar(100)
+
+  // State transitions
+  arrivedAt       DateTime? @map("arrived_at")
+  seatedAt        DateTime? @map("seated_at")
+  completedAt     DateTime? @map("completed_at")
+  cancelledAt     DateTime? @map("cancelled_at")
+  cancelledReason String?   @map("cancelled_reason") @db.VarChar(255)
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  createdById String?  @map("created_by_id") @db.Uuid
+
+  // Relations
+  location      Location            @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  table         Table?              @relation(fields: [tableId], references: [id], onDelete: SetNull)
+  guestProfile  GuestProfile?       @relation(fields: [guestProfileId], references: [id], onDelete: SetNull)
+  createdBy     Membership?         @relation("ReservationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  arrivalEvents GuestArrivalEvent[]
+
+  @@index([locationId, bookedFor])
+  @@index([tableId])
+  @@index([guestProfileId])
+  @@index([locationId, status])
+  @@map("reservations")
+}
+
+enum ReservationStatus {
+  PENDING_DEPOSIT
+  CONFIRMED
+  ARRIVED
+  SEATED
+  COMPLETED
+  NO_SHOW
+  CANCELLED
+}
+
+enum ReservationSource {
+  WEBSITE
+  GOOGLE
+  PHONE
+  WALK_IN
+  WHATSAPP
+  PARTNER
+  INTERNAL
+}
+
+model WaitlistEntry {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId     String  @map("location_id") @db.Uuid
+  guestProfileId String? @map("guest_profile_id") @db.Uuid
+
+  customerName       String  @map("customer_name") @db.VarChar(200)
+  customerPhone      String  @map("customer_phone") @db.VarChar(30)
+  partySize          Int     @map("party_size")
+  preferredArea      String? @map("preferred_area") @db.VarChar(50)
+  preferredSectionId String? @map("preferred_section_id") @db.Uuid
+
+  // Quote
+  quotedWaitMinutes  Int       @map("quoted_wait_minutes")
+  estimatedSeatingAt DateTime? @map("estimated_seating_at")
+
+  // SMS flow
+  smsSentAt     DateTime? @map("sms_sent_at")
+  smsReplyAt    DateTime? @map("sms_reply_at")
+  smsReplyValue String?   @map("sms_reply_value") @db.VarChar(10)
+
+  // Pre-auth tab (Toast pattern)
+  preAuthCardToken String? @map("pre_auth_card_token") @db.VarChar(255)
+  preAuthAmount    Int?    @map("pre_auth_amount")
+
+  status          WaitlistStatus @default(WAITING)
+  seatedAtTableId String?        @map("seated_at_table_id") @db.Uuid
+  seatedAt        DateTime?      @map("seated_at")
+
+  notes String? @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  location         Location            @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  guestProfile     GuestProfile?       @relation(fields: [guestProfileId], references: [id], onDelete: SetNull)
+  preferredSection Section?            @relation(fields: [preferredSectionId], references: [id], onDelete: SetNull)
+  seatedAtTable    Table?              @relation(fields: [seatedAtTableId], references: [id], onDelete: SetNull)
+  arrivalEvents    GuestArrivalEvent[]
+
+  @@index([locationId, status, createdAt])
+  @@map("waitlist_entries")
+}
+
+enum WaitlistStatus {
+  WAITING
+  NOTIFIED
+  CONFIRMED
+  SEATED
+  NO_SHOW
+  CANCELLED
+}
+
+// ============================================================================
+// APPOINTMENTS — Phase E R1 (2026-07-31)
+//
+// Location business hours already live on Location.operatingHours (JSON,
+// reused from the reservation availability engine). NOT duplicated here.
+//
+// Staff schedules: per-technician per-day-of-week working hours. Missing
+// row = tech follows location business hours. Rows with null start/end =
+// tech doesn't work that day.
+//
+// Time off: full-day off ranges (vacation, sick day, personal). Both
+// dates inclusive.
+//
+// Together these feed the availability engine (src/lib/appointment-
+// availability.ts) which returns free slots given date + services + tech.
+// ============================================================================
+
+model StaffSchedule {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  membershipId String   @map("membership_id") @db.Uuid
+  dayOfWeek    Int      @map("day_of_week")
+  startTime    String?  @map("start_time") @db.VarChar(5)
+  endTime      String?  @map("end_time") @db.VarChar(5)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@unique([membershipId, dayOfWeek])
+  @@index([membershipId])
+  @@map("staff_schedules")
+}
+
+model StaffTimeOff {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  membershipId String   @map("membership_id") @db.Uuid
+  // Both dates inclusive. Single day off → startDate == endDate.
+  startDate    DateTime @map("start_date") @db.Date
+  endDate      DateTime @map("end_date") @db.Date
+  reason       String?  @db.VarChar(255)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@index([membershipId, startDate, endDate])
+  @@map("staff_time_off")
+}
+
+model SectionTemplate {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId String   @map("location_id") @db.Uuid
+  name       String   @db.VarChar(100)
+  dayOfWeek  Int?     @map("day_of_week") // 0..6, null = any day
+  shiftLabel String?  @map("shift_label") @db.VarChar(50)
+  isActive   Boolean  @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  location    Location                  @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  assignments ServerSectionAssignment[]
+
+  @@index([locationId])
+  @@map("section_templates")
+}
+
+model ServerSectionAssignment {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId     String    @map("location_id") @db.Uuid
+  templateId     String?   @map("template_id") @db.Uuid
+  shiftDate      DateTime? @map("shift_date") @db.Date
+  shiftStartTime String?   @map("shift_start_time") // 'HH:MM' time as string for simplicity
+  shiftEndTime   String?   @map("shift_end_time")
+  sectionId      String    @map("section_id") @db.Uuid
+  serverId       String    @map("server_id") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  location Location         @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  template SectionTemplate? @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  section  Section          @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  server   Membership       @relation("ServerSectionAssignment", fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@index([templateId])
+  @@index([locationId, shiftDate])
+  @@index([serverId])
+  @@map("server_section_assignments")
+}
+
+model SpecialDate {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId        String   @map("location_id") @db.Uuid
+  date              DateTime @db.Date
+  label             String   @db.VarChar(100)
+  blockReservations Boolean  @default(false) @map("block_reservations")
+  blockWalkins      Boolean  @default(false) @map("block_walkins")
+  blockOnline       Boolean  @default(false) @map("block_online")
+  customOpenTime    String?  @map("custom_open_time") // 'HH:MM'
+  customCloseTime   String?  @map("custom_close_time")
+  publicMessage     String?  @map("public_message") @db.Text
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([locationId, date])
+  @@map("special_dates")
+}
+
+model GuestArrivalEvent {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId String   @map("location_id") @db.Uuid
+  arrivedAt  DateTime @default(now()) @map("arrived_at")
+
+  partySize Int?          @map("party_size")
+  source    ArrivalSource @default(MANUAL)
+
+  reservationId   String? @map("reservation_id") @db.Uuid
+  waitlistEntryId String? @map("waitlist_entry_id") @db.Uuid
+  guestProfileId  String? @map("guest_profile_id") @db.Uuid
+
+  // Camera-specific (future use)
+  cameraId             String? @map("camera_id") @db.VarChar(100)
+  detectionConfidence  Float?  @map("detection_confidence")
+  faceRecognitionScore Float?  @map("face_recognition_score")
+  rawPayload           Json?   @map("raw_payload")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  location      Location       @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  reservation   Reservation?   @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  waitlistEntry WaitlistEntry? @relation(fields: [waitlistEntryId], references: [id], onDelete: SetNull)
+  guestProfile  GuestProfile?  @relation(fields: [guestProfileId], references: [id], onDelete: SetNull)
+
+  @@index([locationId, arrivedAt(sort: Desc)])
+  @@index([reservationId])
+  @@index([waitlistEntryId])
+  @@map("guest_arrival_events")
+}
+
+enum ArrivalSource {
+  MANUAL
+  CAMERA
+  QR_SCAN
+  WHATSAPP
+  RESERVATION
+}
+
+model UploadedFile {
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String  @map("tenant_id") @db.Uuid
+  uploadedById String? @map("uploaded_by_id") @db.Uuid
+
+  s3Bucket    String  @map("s3_bucket") @db.VarChar(255)
+  s3Key       String  @map("s3_key") @db.VarChar(500)
+  s3Etag      String? @map("s3_etag") @db.VarChar(100)
+  s3VersionId String? @map("s3_version_id") @db.VarChar(100)
+
+  filename  String @db.VarChar(255)
+  mimeType  String @map("mime_type") @db.VarChar(100)
+  sizeBytes BigInt @map("size_bytes")
+  widthPx   Int?   @map("width_px")
+  heightPx  Int?   @map("height_px")
+
+  resourceType String  @map("resource_type") @db.VarChar(50)
+  resourceId   String? @map("resource_id") @db.Uuid
+  isPublic     Boolean @default(true) @map("is_public")
+
+  uploadStatus String    @default("PENDING") @map("upload_status") @db.VarChar(20)
+  uploadedAt   DateTime? @map("uploaded_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  uploadedBy Membership? @relation("FileUploadedBy", fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@unique([s3Bucket, s3Key])
+  @@index([tenantId, resourceType])
+  @@index([resourceType, resourceId])
+  @@map("uploaded_files")
+}
+
+// ============================================================================
+// SECTION 15: RESTAURANT MEDIA  (Phase 3b, 2026-05-18)
+// ============================================================================
+//
+// Per-location media library: photos, videos, 360° panoramas.
+// Surfaces in: admin gallery (manage), customer reservation page (Phase 6),
+// virtual tour viewer (Phase 3c, panoramas become scenes).
+
+model MediaItem {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId String  @map("location_id") @db.Uuid
+  sectionId  String? @map("section_id") @db.Uuid
+  // null = applies to whole location
+  // set = section-specific gallery (e.g. "Patio" only)
+
+  mediaType       MediaType @map("media_type")
+  s3Key           String    @map("s3_key") @db.VarChar(500)
+  publicUrl       String    @map("public_url") @db.VarChar(800)
+  thumbnailUrl    String?   @map("thumbnail_url") @db.VarChar(800)
+  fileSizeBytes   BigInt?   @map("file_size_bytes")
+  widthPx         Int?      @map("width_px")
+  heightPx        Int?      @map("height_px")
+  durationSeconds Int?      @map("duration_seconds")
+
+  caption      String? @db.VarChar(500)
+  altText      String? @map("alt_text") @db.VarChar(500)
+  displayOrder Int     @default(0) @map("display_order")
+  isCover      Boolean @default(false) @map("is_cover")
+
+  // 360° panorama specific
+  sceneName      String? @map("scene_name") @db.VarChar(100)
+  initialYaw     Float?  @default(0) @map("initial_yaw")
+  initialPitch   Float?  @default(0) @map("initial_pitch")
+  initialFov     Float?  @default(90) @map("initial_fov")
+  // Phase 3c (2026-05-18): one default scene per location starts the tour
+  isDefaultScene Boolean @default(false) @map("is_default_scene")
+
+  isActive     Boolean @default(true) @map("is_active")
+  uploadedById String? @map("uploaded_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  location         Location      @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  section          Section?      @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+  uploadedBy       Membership?   @relation("MediaUploadedBy", fields: [uploadedById], references: [id], onDelete: SetNull)
+  // Phase 3c (2026-05-18): hotspots placed on this 360° scene
+  hotspots         TourHotspot[] @relation("SceneHotspots")
+  // Hotspots that TARGET this scene (back-reference)
+  incomingHotspots TourHotspot[] @relation("HotspotTargetScene")
+
+  @@index([locationId, displayOrder])
+  @@index([sectionId])
+  @@index([locationId, mediaType])
+  @@map("media_items")
+}
+
+enum MediaType {
+  PHOTO
+  VIDEO
+  PANORAMA_360
+}
+
+// ============================================================================
+// SECTION 16: VIRTUAL TOUR  (Phase 3c, 2026-05-18)
+// ============================================================================
+//
+// Hotspots placed inside 360° panoramas. Powers the Zillow-style virtual
+// tour where customers can:
+//   - Walk between scenes (SCENE_LINK)
+//   - Click a table to book it (TABLE_LINK)
+//   - Read info popups (INFO)
+//   - Open external links like menu PDFs (EXTERNAL_URL)
+
+model TourHotspot {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sceneMediaId String @map("scene_media_id") @db.Uuid
+
+  hotspotType HotspotType @map("hotspot_type")
+
+  // Position in spherical coordinates (Pannellum convention)
+  yaw   Float // -180..180 horizontal angle
+  pitch Float // -90..90 vertical angle
+
+  // Display
+  label   String  @db.VarChar(200)
+  iconUrl String? @map("icon_url") @db.VarChar(500)
+
+  // Targets — only one populated depending on hotspotType (CHECK constraint in DB)
+  targetSceneMediaId String? @map("target_scene_media_id") @db.Uuid
+  targetTableId      String? @map("target_table_id") @db.Uuid
+  externalUrl        String? @map("external_url") @db.VarChar(800)
+
+  // For SCENE_LINK — where to look when arriving at the target scene
+  targetYaw   Float? @map("target_yaw")
+  targetPitch Float? @map("target_pitch")
+
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  scene       MediaItem  @relation("SceneHotspots", fields: [sceneMediaId], references: [id], onDelete: Cascade)
+  targetScene MediaItem? @relation("HotspotTargetScene", fields: [targetSceneMediaId], references: [id], onDelete: SetNull)
+  targetTable Table?     @relation("HotspotTargetTable", fields: [targetTableId], references: [id], onDelete: SetNull)
+
+  @@index([sceneMediaId])
+  @@index([targetSceneMediaId])
+  @@index([targetTableId])
+  @@map("tour_hotspots")
+}
+
+enum HotspotType {
+  SCENE_LINK
+  TABLE_LINK
+  INFO
+  EXTERNAL_URL
+}
+
+// ============================================
+// SECTION 25: CONVERSATION INBOX (Phase 5d, 2026-05-18)
+// ============================================
+// All inbound SMS / WhatsApp messages that don't match a waitlist 1/9 reply
+// land here. Staff can view + respond from admin portal (UI in future phase).
+// Schema ships in Phase 5d so we capture data from day one.
+// ============================================================
+
+model ConversationMessage {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String    @map("tenant_id") @db.Uuid
+  locationId    String?   @map("location_id") @db.Uuid
+  channel       String    @db.VarChar(20) // 'SMS' | 'WHATSAPP'
+  direction     String    @db.VarChar(10) // 'INBOUND' | 'OUTBOUND'
+  fromPhone     String    @map("from_phone") @db.VarChar(30)
+  toPhone       String    @map("to_phone") @db.VarChar(30)
+  body          String?   @db.Text
+  providerMsgId String?   @map("provider_msg_id") @db.VarChar(255)
+  relatedKind   String?   @map("related_kind") @db.VarChar(30) // 'waitlist' | 'reservation' | null
+  relatedId     String?   @map("related_id") @db.Uuid
+  rawPayload    Json?     @map("raw_payload")
+  readAt        DateTime? @map("read_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt(sort: Desc)], map: "idx_conv_msgs_tenant_created")
+  @@index([fromPhone, toPhone], map: "idx_conv_msgs_phone")
+  @@map("conversation_messages")
+}
+
+// ============================================================================
+// SUPPLIER MARKETPLACE — Phase 8 (2026-07-30)
+// ============================================================================
+// A supplier is a Tenant with businessType='supplier'. Only supplier tenants
+// have a SupplierProfile row (one-to-one). Merchants and suppliers are linked
+// through SupplierMerchantRelationship rows — created either from an accepted
+// SupplierInvite (merchant found the supplier first) or from a merchant
+// clicking "connect" on a publicly-listed supplier in the marketplace.
+//
+// Catalog + orders + payment gateway credentials arrive in Phases B/C.
+// ============================================================================
+
+enum SupplierInviteStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  CANCELLED
+}
+
+enum SupplierRelationshipStatus {
+  ACTIVE
+  PAUSED
+  TERMINATED
+}
+
+enum SupplierRelationshipSource {
+  INVITE // merchant invited the supplier, supplier accepted
+  MARKETPLACE // merchant discovered a public supplier and connected
+}
+
+// Onboarding funnel for a supplier tenant. Drives the supplier portal's
+// dashboard "next step" tile. NEW = just signed up. CATALOG_SETUP = has
+// a profile but hasn't uploaded products yet. GATEWAY_PENDING = catalog
+// exists, waiting on payment-gateway approval. ACTIVE = fully live.
+enum SupplierOnboardingStatus {
+  NEW
+  CATALOG_SETUP
+  GATEWAY_PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+model SupplierProfile {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @unique @map("tenant_id") @db.Uuid
+
+  // Company info — a supplier is a real business; these fields are what
+  // shows up on merchant-facing profile pages and on payment gateway leads.
+  legalName    String? @map("legal_name") @db.VarChar(255)
+  displayName  String? @map("display_name") @db.VarChar(255)
+  websiteUrl   String? @map("website_url") @db.VarChar(500)
+  contactEmail String? @map("contact_email") @db.VarChar(255)
+  contactPhone String? @map("contact_phone") @db.VarChar(30)
+  aboutText    String? @map("about_text") @db.Text
+
+  // Warehouse / shipping origin. Stored as JSON so we don't have to redesign
+  // the schema when we later add lat/lng or multiple warehouses.
+  warehouseAddress Json? @map("warehouse_address")
+
+  // Categories the supplier serves — free-text tags for now. Later we'll
+  // migrate to a normalized taxonomy for browsing/filtering the marketplace.
+  categories String[] @default([])
+
+  // Business rules
+  minOrderCents       Int    @default(0) @map("min_order_cents")
+  defaultLeadDays     Int    @default(3) @map("default_lead_days")
+  // Phase D #75 (2026-07-31): default payment terms — days after PO
+  // submission before the balance is considered "due". 30 = Net 30
+  // (industry standard). Set to 0 for cash-on-delivery.
+  defaultNetTermsDays Int    @default(30) @map("default_net_terms_days")
+  currency            String @default("CAD") @db.VarChar(3)
+
+  // Marketplace visibility. When false, only merchants who invited this
+  // supplier can see the catalog. When true, the supplier is listed publicly
+  // in the marketplace for any merchant to find.
+  isPublic Boolean @default(false) @map("is_public")
+
+  // Funnel state — the dashboard uses this to show the "next step" tile.
+  onboardingStatus SupplierOnboardingStatus @default(NEW) @map("onboarding_status")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([isPublic])
+  @@index([onboardingStatus])
+  @@map("supplier_profiles")
+}
+
+model SupplierInvite {
+  id               String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // Merchant tenant sending the invite.
+  fromTenantId     String  @map("from_tenant_id") @db.Uuid
+  // Who on the merchant side clicked "invite" — audit trail. Nullable in case
+  // the membership is later deleted; the invite record survives.
+  fromMembershipId String? @map("from_membership_id") @db.Uuid
+
+  // Recipient info. Email is the canonical identifier — we don't require the
+  // supplier to have an account yet.
+  email       String  @db.VarChar(255)
+  companyName String? @map("company_name") @db.VarChar(255)
+  contactName String? @map("contact_name") @db.VarChar(100)
+  phone       String? @db.VarChar(30)
+  message     String? @db.Text
+
+  // Cryptographic token in the invite link; single-use. Indexed unique so
+  // the accept endpoint can look it up in O(1) without exposing the invite id.
+  token String @unique @db.VarChar(64)
+
+  status     SupplierInviteStatus @default(PENDING)
+  expiresAt  DateTime             @map("expires_at")
+  acceptedAt DateTime?            @map("accepted_at")
+
+  // Once accepted, we know which supplier tenant was created (or which
+  // existing supplier tenant linked in). Null until acceptance.
+  acceptedTenantId String? @map("accepted_tenant_id") @db.Uuid
+
+  // If the invite was created FROM an existing local Supplier row on the
+  // merchant's inventory list, this points back to it. On acceptance we
+  // update that Supplier.linkedTenantId to the new supplier tenant.
+  localSupplierId String? @map("local_supplier_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  fromTenant Tenant @relation("SupplierInvitesFromMerchant", fields: [fromTenantId], references: [id], onDelete: Cascade)
+
+  @@index([fromTenantId, status])
+  @@index([email])
+  @@map("supplier_invites")
+}
+
+model SupplierMerchantRelationship {
+  id               String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // The supplier's tenant (businessType='supplier').
+  supplierTenantId String @map("supplier_tenant_id") @db.Uuid
+  // The merchant's tenant (restaurant/retail/salon/etc.).
+  merchantTenantId String @map("merchant_tenant_id") @db.Uuid
+
+  status   SupplierRelationshipStatus @default(ACTIVE)
+  source   SupplierRelationshipSource @default(INVITE)
+  // If this relationship was created via an accepted invite, keep the pointer
+  // for audit/analytics. Null when the merchant discovered the supplier
+  // through the public marketplace.
+  inviteId String?                    @map("invite_id") @db.Uuid
+
+  // Denormalized stats for fast dashboard tiles. Kept up-to-date by the PO
+  // service in Phase B (fire-and-forget after each PO lifecycle event).
+  firstOrderAt    DateTime? @map("first_order_at")
+  lastOrderAt     DateTime? @map("last_order_at")
+  totalOrders     Int       @default(0) @map("total_orders")
+  totalSpentCents Int       @default(0) @map("total_spent_cents")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  supplierTenant Tenant @relation("RelationshipSupplierSide", fields: [supplierTenantId], references: [id], onDelete: Cascade)
+  merchantTenant Tenant @relation("RelationshipMerchantSide", fields: [merchantTenantId], references: [id], onDelete: Cascade)
+
+  // A merchant can only have ONE relationship row per supplier. If they
+  // pause/terminate and want to reconnect, flip status back to ACTIVE
+  // rather than creating a second row.
+  // Purchase orders under this relationship. Optional linkage — POs also
+  // carry supplierTenantId + merchantTenantId directly, so this is really
+  // a convenience for "show all POs with this partner" queries.
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([supplierTenantId, merchantTenantId])
+  @@index([supplierTenantId, status])
+  @@index([merchantTenantId, status])
+  @@map("supplier_merchant_relationships")
+}
+
+// ============================================================================
+// SUPPLIER CATALOG — Phase B (2026-07-30)
+// ============================================================================
+// Products, categories, and images owned by a supplier tenant. Kept separate
+// from the merchant-side Product/Category models on purpose:
+//   - Suppliers price in wholesale, not retail
+//   - They have min-order quantities and lead times
+//   - They may go public in the marketplace where merchants they've never
+//     met can see them
+// Same-table reuse would have required nullable columns for half the fields
+// AND polluted queries on both sides. Two clean models > one messy one.
+// ============================================================================
+
+model SupplierProductCategory {
+  id               String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  supplierTenantId String @map("supplier_tenant_id") @db.Uuid
+
+  name        String  @db.VarChar(100)
+  description String? @db.VarChar(500)
+  sortOrder   Int     @default(0) @map("sort_order")
+  isActive    Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  supplierTenant Tenant            @relation(fields: [supplierTenantId], references: [id], onDelete: Cascade)
+  products       SupplierProduct[]
+
+  // A supplier can't have two categories with the same name — cheap DB-level
+  // guard against accidental duplication via bulk import.
+  @@unique([supplierTenantId, name])
+  @@index([supplierTenantId, isActive])
+  @@map("supplier_product_categories")
+}
+
+model SupplierProduct {
+  id               String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  supplierTenantId String  @map("supplier_tenant_id") @db.Uuid
+  categoryId       String? @map("category_id") @db.Uuid
+
+  // Identifiers
+  sku     String? @db.VarChar(64) // Supplier's own SKU (optional but recommended)
+  barcode String? @db.VarChar(64) // UPC/EAN if applicable
+
+  // Basic info
+  name        String  @db.VarChar(255)
+  description String? @db.Text
+
+  // Unit & packaging. `unitLabel` is what the merchant sees in the cart
+  // ("20kg box", "case of 24") — no unit conversion in v1, just a label.
+  unitLabel String @default("unit") @map("unit_label") @db.VarChar(50)
+
+  // Pricing in cents. wholesalePriceCents is what the merchant pays.
+  // retailPriceCents is an optional reference price the supplier can show
+  // ("MSRP $50") to justify the wholesale ask.
+  wholesalePriceCents Int  @map("wholesale_price_cents")
+  retailPriceCents    Int? @map("retail_price_cents")
+
+  // Order rules — enforced at PO creation, not at display.
+  minOrderQty Int @default(1) @map("min_order_qty")
+  stepQty     Int @default(1) @map("step_qty")
+
+  // Inventory. All three fields are optional — a supplier who doesn't
+  // want to track stock leaves them null and the product is always
+  // orderable. When trackInventory=true the PO flow decrements stockLevel
+  // on delivery and low_stock_threshold drives the supplier's alerts.
+  trackInventory    Boolean @default(false) @map("track_inventory")
+  stockLevel        Int?    @map("stock_level")
+  lowStockThreshold Int?    @map("low_stock_threshold")
+
+  // Overrides for the supplier-profile defaults. leadTimeDays lets a
+  // hard-to-source item advertise a longer lead than the supplier default.
+  leadTimeDays Int? @map("lead_time_days")
+
+  // Visibility. isPublic gates listing in the public marketplace when the
+  // supplier's own profile.isPublic is also true. isActive is a soft-delete
+  // toggle — set false to hide from EVERYONE including invited merchants
+  // without losing history.
+  isPublic Boolean @default(false) @map("is_public")
+  isActive Boolean @default(true) @map("is_active")
+
+  sortOrder Int @default(0) @map("sort_order")
+
+  // Phase D #70 (2026-07-30): variant axes. Empty = simple product (sold
+  // as-is, stock/price on this row). Non-empty = product has variants —
+  // each combination lives in SupplierProductVariant. Axis names are
+  // arbitrary: ["Weight", "Format"] for cheese, ["Size", "Color"] for
+  // shirts, ["Vintage", "Bottle Size"] for wine.
+  //
+  // When variants exist, the product-level wholesalePriceCents / stockLevel /
+  // minOrderQty / stepQty become the DEFAULTS variants inherit if not
+  // overridden. Merchant orders reference a specific variantId.
+  variantAxes String[] @default([]) @map("variant_axes")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  supplierTenant          Tenant                     @relation(fields: [supplierTenantId], references: [id], onDelete: Cascade)
+  category                SupplierProductCategory?   @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  images                  SupplierProductImage[]
+  variants                SupplierProductVariant[]
+  // Phase D #73 (2026-07-30): volume-tier pricing on simple products.
+  // For products WITH variants, tiers live on the variant rows instead.
+  priceTiers              SupplierProductPriceTier[]
+  // PO line items referencing this product. On delete we SET NULL rather
+  // than cascade — line items keep their frozen name/price/SKU snapshot,
+  // just lose the live link back to the (deleted) product.
+  purchaseOrderItems      PurchaseOrderItem[]
+  // Phase D #77 (2026-07-31): merchant Ingredients that name this product
+  // as their preferred restock source. Back-ref for
+  // Ingredient.preferredSupplierProductId.
+  preferredForIngredients Ingredient[]               @relation("IngredientPreferredSupplierProduct")
+
+  // SKU is unique per supplier when set (nullable — some catalogs don't
+  // have SKUs). Partial unique index in SQL because Prisma can't express
+  // "unique WHERE NOT NULL"; enforced there.
+  @@index([supplierTenantId, isActive])
+  @@index([supplierTenantId, categoryId])
+  @@index([supplierTenantId, isPublic])
+  @@map("supplier_products")
+}
+
+// One row per image on a supplier product. Separate table (rather than a
+// JSON array on SupplierProduct) so we can:
+//   1. Reorder / delete individual images without rewriting the whole product
+//   2. Avoid loading base64 image data when just listing product names/prices
+//   3. Later move to S3 keys without touching the product model
+//
+// `dataUrl` is Text so it can hold either a base64 data URL (Phase B v1)
+// or an S3 URL (later).
+model SupplierProductImage {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId String @map("product_id") @db.Uuid
+
+  dataUrl   String  @map("data_url") @db.Text
+  altText   String? @map("alt_text") @db.VarChar(200)
+  sortOrder Int     @default(0) @map("sort_order")
+  isPrimary Boolean @default(false) @map("is_primary")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  product SupplierProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, sortOrder])
+  @@map("supplier_product_images")
+}
+
+// Phase D #70 (2026-07-30): product variants.
+//
+// A variant is one point in the N-dimensional space defined by the
+// parent product's `variantAxes`. Example:
+//   product.variantAxes = ["Weight", "Format"]
+//   variant #1: attributes = { "Weight": "1kg",  "Format": "Block" }
+//   variant #2: attributes = { "Weight": "1kg",  "Format": "Grated" }
+//   variant #3: attributes = { "Weight": "20kg", "Format": "Block" }
+//
+// `attributes` shape is deliberately unconstrained JSON — the axis names
+// are whatever the supplier types, and the values are free-form strings.
+// The consuming UI derives `displayName` for merchants ("1kg · Block").
+//
+// Every price/stock/order-rule field is NULLABLE — leaving it null means
+// "inherit from the parent product". This lets a supplier bulk-set price
+// on the product and only override on variants that differ.
+model SupplierProductVariant {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId String @map("product_id") @db.Uuid
+
+  // Merchant-facing label. Auto-derived from `attributes` when saved
+  // ("1kg · Block") but stored so future axis-rename doesn't break
+  // historical PO line items that reference this variant.
+  displayName String @map("display_name") @db.VarChar(255)
+
+  // Free-form JSON: { axisName: value } for every axis on the parent
+  // product. Validated at write time against product.variantAxes.
+  attributes Json
+
+  // Per-variant SKU + barcode. SKU unique per PARENT product when set.
+  sku     String? @db.VarChar(64)
+  barcode String? @db.VarChar(64)
+
+  // All pricing/stock/order-rule overrides — null = inherit from product.
+  wholesalePriceCents Int?    @map("wholesale_price_cents")
+  retailPriceCents    Int?    @map("retail_price_cents")
+  minOrderQty         Int?    @map("min_order_qty")
+  stepQty             Int?    @map("step_qty")
+  trackInventory      Boolean @default(false) @map("track_inventory")
+  stockLevel          Int?    @map("stock_level")
+  lowStockThreshold   Int?    @map("low_stock_threshold")
+
+  // Optional per-variant image. Falls back to the parent product's
+  // primary image when null. Base64 data URL, same pattern as
+  // SupplierProductImage.dataUrl.
+  imageDataUrl String? @map("image_data_url") @db.Text
+
+  isActive  Boolean @default(true) @map("is_active")
+  sortOrder Int     @default(0) @map("sort_order")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  product            SupplierProduct            @relation(fields: [productId], references: [id], onDelete: Cascade)
+  purchaseOrderItems PurchaseOrderItem[]
+  // Phase D #73 (2026-07-30): per-variant volume tiers.
+  priceTiers         SupplierProductPriceTier[]
+
+  // SKU unique per product when set. Partial unique index in SQL because
+  // Prisma can't express "unique WHERE NOT NULL" natively.
+  @@index([productId, isActive])
+  @@map("supplier_product_variants")
+}
+
+// Phase D #73 (2026-07-30): volume-tier pricing.
+//
+// A tier says "at qty ≥ minQty, unit price becomes unitPriceCents".
+// Attached to EITHER a product (simple product with no variants) OR a
+// variant — exactly one of productId/variantId is set. Enforced by a
+// CHECK constraint in SQL because Prisma can't express XOR in the model.
+//
+// Resolution at order time: pick the tier with the HIGHEST minQty ≤ qty.
+// If no tier applies, fall back to the product/variant default price.
+// See src/lib/supplier-price-tiers.ts for the resolver.
+model SupplierProductPriceTier {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId String? @map("product_id") @db.Uuid
+  variantId String? @map("variant_id") @db.Uuid
+
+  minQty         Int @map("min_qty")
+  unitPriceCents Int @map("unit_price_cents")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  product SupplierProduct?        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant SupplierProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@index([productId, minQty])
+  @@index([variantId, minQty])
+  @@map("supplier_product_price_tiers")
+}
+
+// Phase D #74 (2026-07-30): in-app messaging per PO.
+//
+// Simple two-party chat scoped to a single PO. `senderSide` is the
+// canonical MERCHANT/SUPPLIER identity — cheaper than joining back
+// through membership → tenant on every render, and durable if the
+// membership row is deleted later.
+//
+// Read state is per-SIDE, not per-user: when a user on side A opens the
+// thread, we mark every message from side B as read (fills
+// `readByOtherSideAt`). Fine for B2B where each side is essentially
+// one voice. Per-user read receipts would need a separate table.
+enum PoMessageSide {
+  MERCHANT
+  SUPPLIER
+}
+
+model PurchaseOrderMessage {
+  id              String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  purchaseOrderId String @map("purchase_order_id") @db.Uuid
+
+  senderSide         PoMessageSide @map("sender_side")
+  // Nullable — a deleted membership shouldn't wipe the message. `senderName`
+  // snapshot preserves attribution.
+  senderMembershipId String?       @map("sender_membership_id") @db.Uuid
+  senderName         String?       @map("sender_name") @db.VarChar(150)
+
+  body String @db.Text
+
+  // Filled when the OTHER side opens the thread — drives unread badges
+  // on both the order-list rows and the message chip on PO detail.
+  readByOtherSideAt DateTime? @map("read_by_other_side_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  purchaseOrder    PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  senderMembership Membership?   @relation("PoMessageSender", fields: [senderMembershipId], references: [id], onDelete: SetNull)
+
+  @@index([purchaseOrderId, createdAt])
+  // Fast "unread count for me" query: WHERE purchaseOrderId=X AND senderSide=OTHER AND readByOtherSideAt IS NULL
+  @@index([purchaseOrderId, senderSide, readByOtherSideAt])
+  @@map("purchase_order_messages")
+}
+
+// ============================================================================
+// PURCHASE ORDERS — Phase B (2026-07-30)
+// ============================================================================
+// A merchant creates a PO addressed to one supplier. Line items snapshot
+// the product name, SKU, unit label, and unit price at submit time — so a
+// supplier can rename or delete a product without the PO's history changing.
+//
+// Status flow (linear except CANCELLED can happen from any non-terminal
+// state; there is no DRAFT — the merchant's in-progress cart lives in
+// localStorage, never in the DB):
+//
+//     SUBMITTED ──> ACKNOWLEDGED ──> SHIPPED ──> DELIVERED
+//         │              │             │
+//         └──────────────┴─────────────┴──> CANCELLED
+//
+// Timestamps live on the PO row (submittedAt / acknowledgedAt / etc.)
+// rather than in a separate events table — enough for the reports we
+// need in Phase B. A proper audit-log table can be added in Phase C.
+// ============================================================================
+
+enum PurchaseOrderStatus {
+  SUBMITTED
+  ACKNOWLEDGED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+// ============================================================================
+// SUPPLIER WAREHOUSE — Phase D #76 (2026-07-31)
+//
+// A fulfillment origin the supplier ships from. Regional distributors
+// typically have 2–4 (Toronto DC, Montreal Cold Storage, Vancouver
+// hub); single-location suppliers just have one row marked isDefault.
+//
+// Merchants see which warehouse their PO is coming from — useful for
+// transit-time estimation and pick-up scenarios. Assignment happens at
+// PO acknowledgement (supplier picks); the default warehouse is used
+// when the supplier doesn't override.
+//
+// v1 is passive routing (supplier picks). v2 will auto-assign based on
+// merchant location vs. servesRegions.
+// ============================================================================
+
+model SupplierWarehouse {
+  id               String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  supplierTenantId String @map("supplier_tenant_id") @db.Uuid
+
+  name       String  @db.VarChar(120) // "Toronto DC"
+  address    String  @db.Text
+  city       String? @db.VarChar(120)
+  province   String? @db.VarChar(120)
+  postalCode String? @map("postal_code") @db.VarChar(20)
+  country    String  @default("CA") @db.VarChar(2)
+  phone      String? @db.VarChar(30)
+
+  // Regions this warehouse serves. Empty array = serves ALL regions
+  // (typical for the default warehouse). Populated arrays gate the
+  // (future) auto-router.
+  servesRegions String[] @default([]) @map("serves_regions")
+
+  // At most one default per supplier — enforced by partial unique index
+  // in SQL, since Prisma can't express that.
+  isDefault Boolean @default(false) @map("is_default")
+  isActive  Boolean @default(true) @map("is_active")
+
+  notes     String? @db.Text // hours, PO instructions, etc.
+  sortOrder Int     @default(0) @map("sort_order")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  supplierTenant Tenant          @relation("SupplierWarehouses", fields: [supplierTenantId], references: [id], onDelete: Cascade)
+  purchaseOrders PurchaseOrder[] @relation("PoWarehouse")
+
+  @@unique([supplierTenantId, name])
+  @@index([supplierTenantId, isActive])
+  @@map("supplier_warehouses")
+}
+
+// Phase C #67 (2026-07-30): payment lifecycle on a PO. Independent from
+// the fulfillment status — a PO can be PAID before it's SHIPPED, or PAID
+// after it's DELIVERED, depending on merchant/supplier terms.
+//
+// Renamed from `PaymentStatus` → `POPaymentStatus` to avoid a name
+// collision with the pre-existing `PaymentStatus` enum on the merchant
+// Payment/Order tables (different lifecycle semantics — that one is for
+// POS-side payment records; this one is B2B purchase orders).
+enum POPaymentStatus {
+  UNPAID // No link generated, or generated but not attempted yet
+  PENDING // Merchant clicked the link, processor is processing
+  PAID // Processor confirmed capture via webhook
+  FAILED // Processor rejected (card declined, expired, etc.)
+  REFUNDED // Payment reversed after capture
+}
+
+model PurchaseOrder {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  // Parties. Both are Tenants — supplier + merchant.
+  supplierTenantId   String  @map("supplier_tenant_id") @db.Uuid
+  merchantTenantId   String  @map("merchant_tenant_id") @db.Uuid
+  merchantLocationId String  @map("merchant_location_id") @db.Uuid
+  relationshipId     String? @map("relationship_id") @db.Uuid
+
+  // Human-readable PO number. Generated on submit — sequential per supplier,
+  // format "PO-YYYY-NNNN" (e.g. "PO-2026-0042"). Unique per supplier via
+  // partial unique index in SQL (skipping this in Prisma-land because
+  // partial indexes aren't expressible; enforced by the migration).
+  poNumber String @map("po_number") @db.VarChar(30)
+
+  status PurchaseOrderStatus @default(SUBMITTED)
+
+  // Money snapshot in cents. Currency snapshotted from the supplier at
+  // submit time so a currency change on the supplier profile never
+  // rewrites history.
+  currency      String @default("CAD") @db.VarChar(3)
+  subtotalCents Int    @map("subtotal_cents")
+  // Taxes on B2B wholesale are messy (varies by jurisdiction, exemptions,
+  // resale certs, etc.). Kept as a nullable field for now; Phase C or later
+  // will fold in tax computation. Default zero means the total = subtotal.
+  taxCents      Int    @default(0) @map("tax_cents")
+  totalCents    Int    @map("total_cents")
+
+  // Shipping address — snapshot of the merchant location's address at
+  // submit time. JSON so we can add fields (like lat/lng) without a schema
+  // change.
+  shippingAddress Json @map("shipping_address")
+
+  // Free-text notes — one from each side of the exchange.
+  notesToSupplier   String? @map("notes_to_supplier") @db.Text
+  notesFromSupplier String? @map("notes_from_supplier") @db.Text
+
+  // Shipment tracking. Set by supplier when marking SHIPPED.
+  shipmentCarrier     String?   @map("shipment_carrier") @db.VarChar(100)
+  shipmentTrackingRef String?   @map("shipment_tracking_ref") @db.VarChar(200)
+  expectedDeliveryAt  DateTime? @map("expected_delivery_at")
+
+  // Cancellation. Both merchant and supplier can cancel; we track WHO did
+  // it (for support-side auditing) and WHY (freeform reason).
+  cancelledByMembershipId String? @map("cancelled_by_membership_id") @db.Uuid
+  cancellationReason      String? @map("cancellation_reason") @db.Text
+
+  // Lifecycle timestamps. submittedAt is set at row creation; the rest
+  // fill in as status transitions happen.
+  submittedAt    DateTime  @default(now()) @map("submitted_at")
+  acknowledgedAt DateTime? @map("acknowledged_at")
+  shippedAt      DateTime? @map("shipped_at")
+  deliveredAt    DateTime? @map("delivered_at")
+  cancelledAt    DateTime? @map("cancelled_at")
+
+  createdByMembershipId String?  @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  // Phase D #77 (2026-07-31): flags POs that came from the auto-reorder
+  // scanner (as opposed to a merchant clicking "Place order" manually).
+  // Used to badge the row in the PO list so merchants can spot them and
+  // review before the supplier acknowledges.
+  autoGenerated Boolean @default(false) @map("auto_generated")
+
+  // Phase D #76 (2026-07-31): fulfillment warehouse. Null = ships from
+  // the supplier's default warehouse (or the supplier hasn't set one).
+  // Supplier picks at acknowledgement; merchant only reads.
+  warehouseId String?            @map("warehouse_id") @db.Uuid
+  warehouse   SupplierWarehouse? @relation("PoWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
+
+  // Phase C #67 (2026-07-30): payment link + status.
+  // paymentStatus is INDEPENDENT of the fulfillment status flow above —
+  // a supplier can ship goods before the merchant pays, or vice versa.
+  //
+  // paymentLinkUrl is the processor-hosted checkout URL (GP / Moneris /
+  // etc.) — we NEVER handle the card details ourselves.
+  // paymentLinkReference is the processor's own transaction / order ID
+  // that we use to reconcile webhook events back to this PO.
+  paymentStatus          POPaymentStatus @default(UNPAID) @map("payment_status")
+  paymentLinkUrl         String?         @map("payment_link_url") @db.Text
+  paymentLinkReference   String?         @map("payment_link_reference") @db.VarChar(200)
+  paymentLinkExpiresAt   DateTime?       @map("payment_link_expires_at")
+  paymentLinkFailureNote String?         @map("payment_link_failure_note") @db.Text // set when generation fails so admin can see why
+  paidAt                 DateTime?       @map("paid_at")
+  paidAmountCents        Int?            @map("paid_amount_cents")
+  paidMethod             String?         @map("paid_method") @db.VarChar(50)
+
+  supplierTenant        Tenant                        @relation("PurchaseOrderSupplier", fields: [supplierTenantId], references: [id], onDelete: Cascade)
+  merchantTenant        Tenant                        @relation("PurchaseOrderMerchant", fields: [merchantTenantId], references: [id], onDelete: Cascade)
+  merchantLocation      Location                      @relation("PurchaseOrderShippingLocation", fields: [merchantLocationId], references: [id], onDelete: Restrict)
+  relationship          SupplierMerchantRelationship? @relation(fields: [relationshipId], references: [id], onDelete: SetNull)
+  createdByMembership   Membership?                   @relation("PurchaseOrderCreatedBy", fields: [createdByMembershipId], references: [id], onDelete: SetNull)
+  cancelledByMembership Membership?                   @relation("PurchaseOrderCancelledBy", fields: [cancelledByMembershipId], references: [id], onDelete: SetNull)
+
+  items    PurchaseOrderItem[]
+  // Phase D #74 (2026-07-30): message thread between merchant + supplier
+  // scoped to this specific PO.
+  messages PurchaseOrderMessage[]
+
+  @@index([supplierTenantId, status])
+  @@index([merchantTenantId, status])
+  @@index([merchantLocationId])
+  @@index([submittedAt(sort: Desc)])
+  // Fast lookup by processor reference for the webhook path (#68) —
+  // webhook comes in with a transaction id, we need to find the PO.
+  @@index([paymentLinkReference])
+  @@map("purchase_orders")
+}
+
+// Line item on a PO. Fields prefixed `product…` are SNAPSHOTS — frozen at
+// submit time, immune to later renames/deletes of the SupplierProduct.
+// The live productId FK is nullable + ON DELETE SET NULL for exactly this
+// reason: deleting a product must not corrupt PO history.
+model PurchaseOrderItem {
+  id              String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  purchaseOrderId String  @map("purchase_order_id") @db.Uuid
+  productId       String? @map("product_id") @db.Uuid
+  // Phase D #70 (2026-07-30): variant reference. Nullable both because
+  // legacy line items pre-date variants, and because a simple (no-variant)
+  // product's line item references the product directly with variantId=null.
+  // SET NULL on delete for the same reason productId does — history stays
+  // intact even if supplier removes the variant.
+  variantId       String? @map("variant_id") @db.Uuid
+
+  productSku         String? @map("product_sku") @db.VarChar(64)
+  productName        String  @map("product_name") @db.VarChar(255)
+  unitLabel          String  @map("unit_label") @db.VarChar(50)
+  unitPriceCents     Int     @map("unit_price_cents")
+  // Variant snapshot fields — frozen at PO submit, immune to later
+  // supplier edits/deletes. Both null for simple-product line items.
+  variantDisplayName String? @map("variant_display_name") @db.VarChar(255)
+  variantAttributes  Json?   @map("variant_attributes")
+
+  qty            Int
+  lineTotalCents Int @map("line_total_cents")
+
+  notes     String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  purchaseOrder PurchaseOrder           @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product       SupplierProduct?        @relation(fields: [productId], references: [id], onDelete: SetNull)
+  variant       SupplierProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  @@index([purchaseOrderId])
+  @@index([productId])
+  @@index([variantId])
+  @@map("purchase_order_items")
+}
+
+// ============================================================================
+// MERCHANT / SUPPLIER PAYMENT ONBOARDING
+// Phase C (2026-07-30) — suppliers only
+// Phase 2b (2026-08) — extended for merchants + granular KYB
+// ============================================================================
+// A tenant (supplier OR merchant) that wants to accept card payments through
+// the platform fills out a MerchantApplication. Platform admin reviews it,
+// forwards it as an email lead to the processor (GP / Moneris / etc.), and
+// once approved records the resulting credentials in TenantPaymentProvider.
+//
+// tenantRole distinguishes SUPPLIER (marketplace payments — Phase C) from
+// MERCHANT (POS card acceptance — Phase 2b onward). All the workflow and
+// crypto is shared; only the receiving product surface differs.
+//
+// Sensitive KYB fields (tax id, banking, UBO ID numbers) are AES-GCM
+// encrypted at rest via src/lib/kyb-crypto.ts — stored as base64 Text.
+// Non-sensitive fields (legal name, address, mcc) are plaintext so the
+// admin review UI can list applications without decrypting every row.
+//
+// UBOs / KYB documents / lifecycle events each live in their own tables
+// (UboRecord, KybDocument, ApplicationEvent) so the admin UI can render
+// grids without a decrypt for every row.
+//
+// See also: notes in kyb-crypto.ts for key management.
+// ============================================================================
+
+enum PaymentProcessor {
+  GP
+  MONERIS
+  STRIPE
+}
+
+enum GatewayApplicationStatus {
+  DRAFT
+  SUBMITTED
+  IN_REVIEW
+  FORWARDED
+  INFO_REQUESTED
+  PROVIDER_APPROVED
+  APPROVED
+  REJECTED
+  LIVE
+}
+
+enum SupplierProcessorStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+// Which product surface the applying tenant plays. Phase 2b splits merchant
+// (POS card acceptance) from supplier (marketplace payments) so a single
+// admin queue can serve both.
+enum TenantRole {
+  MERCHANT
+  SUPPLIER
+}
+
+// Payment capability slot filled by a TenantPaymentProvider row. Lets a
+// single tenant run e.g. GP for CARD and Moneris for INTERAC at the same
+// time — the unique key is (tenantId, capability, processor).
+enum TenantPaymentCapability {
+  CARD
+  INTERAC
+  GIFT_CARD
+  ACH
+}
+
+// KYB / onboarding document categories. Persisted as a Postgres enum so the
+// admin UI can render fixed sections in a stable order.
+enum KybDocType {
+  ARTICLES_OF_INCORPORATION
+  BUSINESS_LICENSE
+  VOID_CHEQUE
+  BANK_STATEMENT
+  UBO_ID_FRONT
+  UBO_ID_BACK
+  UBO_PROOF_OF_ADDRESS
+  DIRECTOR_ID
+  TAX_RETURN
+  GST_HST_REGISTRATION
+  OTHER
+}
+
+enum UboIdType {
+  PASSPORT
+  DRIVERS_LICENSE
+  NATIONAL_ID
+}
+
+// Who moved an application from one state to another. actorId is the FK-ish
+// pointer whose meaning depends on this discriminator (membershipId for
+// MERCHANT, adminUserId for ADMIN, nullable for PROCESSOR / SYSTEM).
+enum EventActorType {
+  MERCHANT
+  ADMIN
+  PROCESSOR
+  SYSTEM
+}
+
+model MerchantApplication {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  // MERCHANT or SUPPLIER — decides which merchant-side wizard rendered this
+  // and which admin filter surfaces it. Legacy rows backfill to SUPPLIER.
+  tenantRole TenantRole @default(SUPPLIER) @map("tenant_role")
+
+  // Optional at submit — supplier can leave blank and let the admin decide
+  // which processor to route to based on volume, region, etc.
+  targetProcessor PaymentProcessor? @map("target_processor")
+
+  status GatewayApplicationStatus @default(SUBMITTED)
+
+  // --- Business info (plaintext, not sensitive) ---
+  legalName           String    @map("legal_name") @db.VarChar(255)
+  dbaName             String?   @map("dba_name") @db.VarChar(255)
+  businessTypeName    String?   @map("business_type_name") @db.VarChar(50) // "LLC", "Corp", "Sole Prop", etc.
+  incorporationDate   DateTime? @map("incorporation_date") @db.Date
+  incorporationRegion String?   @map("incorporation_region") @db.VarChar(100) // "Ontario", "Delaware", etc.
+  businessAddress     Json?     @map("business_address")
+  websiteUrl          String?   @map("website_url") @db.VarChar(500)
+  mccCode             String?   @map("mcc_code") @db.VarChar(10)
+
+  // --- Financial projections ---
+  projectedMonthlyVolumeCents Int?   @map("projected_monthly_volume_cents")
+  averageTicketCents          Int?   @map("average_ticket_cents")
+  currency                    String @default("CAD") @db.VarChar(3)
+
+  // --- Sensitive KYB (AES-GCM encrypted, base64 Text) ---
+  // tax_id_enc: single string — EIN, BN, TIN, whatever the region uses.
+  // bank_info_enc: JSON {accountHolderName, routingNumber, accountNumber, bankName}
+  // Beneficial owners moved to UboRecord in Phase 2b (2026-08); the legacy
+  // beneficial_owners_enc column is kept in the DB for one release cycle
+  // for rollback, but is intentionally not exposed here.
+  taxIdEnc    String? @map("tax_id_enc") @db.Text
+  bankInfoEnc String? @map("bank_info_enc") @db.Text
+
+  // --- Signer / consent (plaintext — this is the person who submits) ---
+  signerName        String?   @map("signer_name") @db.VarChar(150)
+  signerTitle       String?   @map("signer_title") @db.VarChar(100)
+  signerEmail       String?   @map("signer_email") @db.VarChar(255)
+  signerConsentedAt DateTime? @map("signer_consented_at")
+
+  // --- Admin review fields ---
+  adminNotes           String?           @map("admin_notes") @db.Text
+  // Admin who last acted on the app. Recorded as email — admins aren't
+  // Members of the tenant, so we don't have a membership id.
+  reviewedByAdminEmail String?           @map("reviewed_by_admin_email") @db.VarChar(255)
+  // Processor's onboarding-team email we sent the lead to. Useful for audit.
+  forwardedToEmail     String?           @map("forwarded_to_email") @db.VarChar(255)
+  // Phase 2d — extra forward bookkeeping so the timeline can show the who /
+  // what / where of every "forward to processor" action.
+  forwardedToProcessor PaymentProcessor? @map("forwarded_to_processor")
+  forwardedByAdminId   String?           @map("forwarded_by_admin_id") @db.Uuid
+  forwardBundleS3Key   String?           @map("forward_bundle_s3_key") @db.VarChar(500)
+  processorMessageId   String?           @map("processor_message_id") @db.VarChar(255)
+  // Processor-assigned reference once approved (e.g. GP MID).
+  processorReferenceId String?           @map("processor_reference_id") @db.VarChar(100)
+  rejectionReason      String?           @map("rejection_reason") @db.Text
+  infoRequested        String?           @map("info_requested") @db.Text
+
+  // --- Timestamps for each lifecycle stage ---
+  submittedAt       DateTime  @default(now()) @map("submitted_at")
+  forwardedAt       DateTime? @map("forwarded_at")
+  infoRequestedAt   DateTime? @map("info_requested_at")
+  approvedAt        DateTime? @map("approved_at")
+  rejectedAt        DateTime? @map("rejected_at")
+  lastAdminActionAt DateTime? @map("last_admin_action_at")
+
+  createdByMembershipId String?  @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  tenant              Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdByMembership Membership?            @relation("MerchantApplicationCreatedBy", fields: [createdByMembershipId], references: [id], onDelete: SetNull)
+  // The TenantPaymentProvider row spawned by this application (if approved).
+  // Nullable both ways since a rejected app never gets one.
+  resultingProcessor  TenantPaymentProvider?
+
+  // Phase 2b — granular KYB children.
+  documents KybDocument[]
+  ubos      UboRecord[]
+  events    ApplicationEvent[]
+
+  @@index([tenantId, status])
+  @@index([status, submittedAt(sort: Desc)])
+  @@index([tenantRole, status])
+  @@map("merchant_applications")
+}
+
+model TenantPaymentProvider {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String  @map("tenant_id") @db.Uuid
+  applicationId String? @unique @map("application_id") @db.Uuid
+
+  // Which payment surface this row satisfies (CARD, INTERAC, ...). Lets a
+  // tenant plug in multiple processors simultaneously as long as they each
+  // cover a different capability slot.
+  capability TenantPaymentCapability @default(CARD)
+
+  processor   PaymentProcessor
+  externalMid String           @map("external_mid") @db.VarChar(100)
+
+  // Encrypted JSON of API credentials — shape depends on processor:
+  //   GP:      { app_id, app_key, account_name }
+  //   MONERIS: { store_id, api_token }
+  //   STRIPE:  { access_token, stripe_user_id }
+  credentialsEnc String @map("credentials_enc") @db.Text
+
+  // Fee schedule as JSON so we can evolve the shape without migrations.
+  // Minimal expected: { percentBps: 250, fixedCents: 30 } → 2.5% + $0.30.
+  feeScheduleJson Json? @map("fee_schedule_json")
+
+  status           SupplierProcessorStatus @default(PENDING)
+  activatedAt      DateTime?               @map("activated_at")
+  suspendedAt      DateTime?               @map("suspended_at")
+  suspensionReason String?                 @map("suspension_reason") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  application MerchantApplication? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+
+  // One row per (tenant, capability, processor) triple. Re-onboarding after
+  // suspension UPDATEs the existing row rather than inserting a new one.
+  // The "only one ACTIVE per (tenant, capability)" invariant is enforced
+  // by a partial unique index applied in the SQL migration (Prisma can't
+  // express filtered indexes directly).
+  @@unique([tenantId, capability, processor])
+  @@index([tenantId, status])
+  @@map("tenant_payment_providers")
+}
+
+// One uploaded onboarding document (articles of incorporation, void
+// cheque, UBO ID scan, etc.). Files live in S3 — only the key + metadata
+// are stored in Postgres. Rows are soft-deleted so we retain a paper
+// trail (deletedAt !== null) rather than losing history.
+model KybDocument {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  applicationId String @map("application_id") @db.Uuid
+
+  docType KybDocType @map("doc_type")
+
+  // S3 object key inside the KYB bucket. Bucket + region live in env.
+  s3Key            String @map("s3_key") @db.VarChar(500)
+  originalFilename String @map("original_filename") @db.VarChar(255)
+  mimeType         String @map("mime_type") @db.VarChar(100)
+  sizeBytes        Int    @map("size_bytes")
+
+  // SHA-256 of the file bytes — dedupe + tamper-evidence. Hex-encoded.
+  sha256 String @db.VarChar(64)
+
+  // Nullable when uploaded by an admin (adminUsers aren't Members).
+  uploadedByMembershipId String? @map("uploaded_by_membership_id") @db.Uuid
+
+  // ClamAV / equivalent hook — PENDING | CLEAN | INFECTED | ERROR. Kept as
+  // VarChar rather than a Prisma enum so we can add states in Phase 2e
+  // without a migration.
+  scanStatus String @default("PENDING") @map("scan_status") @db.VarChar(20)
+
+  // Soft-delete for reversibility — a mis-uploaded doc can be hidden
+  // without erasing the audit trail.
+  deletedAt DateTime? @map("deleted_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  application          MerchantApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  uploadedByMembership Membership?         @relation("KybDocumentUploadedBy", fields: [uploadedByMembershipId], references: [id], onDelete: SetNull)
+
+  @@index([applicationId, docType])
+  @@map("kyb_documents")
+}
+
+// Ultimate Beneficial Owner — one row per person on a MerchantApplication.
+// Phase 2b decision: 10 UBOs max in the UI, unlimited in the DB.
+model UboRecord {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  applicationId String @map("application_id") @db.Uuid
+
+  fullName    String   @map("full_name") @db.VarChar(150)
+  dateOfBirth DateTime @map("date_of_birth") @db.Date
+  nationality String   @db.VarChar(3) // ISO 3166-1 alpha-3
+
+  // Structured JSON: { line1, line2, city, province, postalCode, country }
+  residentialAddress Json @map("residential_address")
+
+  ownershipPct Decimal @map("ownership_pct") @db.Decimal(5, 2)
+  isDirector   Boolean @default(false) @map("is_director")
+  isSignatory  Boolean @default(false) @map("is_signatory")
+
+  idType           UboIdType @map("id_type")
+  // AES-GCM encrypted ID number — never stored plaintext.
+  idNumberEnc      String    @map("id_number_enc") @db.Text
+  idExpiry         DateTime? @map("id_expiry") @db.Date
+  idIssuingCountry String?   @map("id_issuing_country") @db.VarChar(3)
+
+  sourceOfFunds String? @map("source_of_funds") @db.VarChar(200)
+  isPep         Boolean @default(false) @map("is_pep") // politically exposed person
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  application MerchantApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@map("ubo_records")
+}
+
+// Immutable log of state transitions + admin actions on a MerchantApplication.
+// Powers the Timeline tab in the admin detail view; never mutated after write.
+model ApplicationEvent {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  applicationId String @map("application_id") @db.Uuid
+
+  fromStatus String? @map("from_status") @db.VarChar(30)
+  toStatus   String  @map("to_status") @db.VarChar(30)
+
+  actorType EventActorType @map("actor_type")
+  // membershipId for MERCHANT actors, adminUserId for ADMIN actors; null
+  // for PROCESSOR / SYSTEM events. Not a hard FK because it points into
+  // different tables depending on actorType.
+  actorId   String?        @map("actor_id") @db.VarChar(64)
+
+  note String? @db.Text
+
+  at DateTime @default(now())
+
+  application MerchantApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, at])
+  @@map("application_events")
+}
+
+// -----------------------------------------------------------------------
+// PLATFORM ADMIN (tapapp-admin only — not used by tap-app runtime)
+// -----------------------------------------------------------------------
+// Separate auth surface for the operator team who runs the whole
+// platform. NOT scoped to a tenant — an AdminUser sees across every
+// tenant in the DB (subject to RBAC).
+
+model AdminUser {
+  id                     String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email                  String          @unique @db.VarChar(255)
+  firstName              String?         @map("first_name") @db.VarChar(100)
+  lastName               String?         @map("last_name") @db.VarChar(100)
+  passwordHash           String          @map("password_hash") @db.VarChar(255)
+  role                   AdminRole       @default(SUPPORT)
+  isActive               Boolean         @default(true) @map("is_active")
+  mfaSecret              String?         @map("mfa_secret") @db.VarChar(128)
+  lastLoginAt            DateTime?       @map("last_login_at")
+  createdAt              DateTime        @default(now()) @map("created_at")
+  updatedAt              DateTime        @updatedAt @map("updated_at")
+  auditLogs              AdminAuditLog[]
+  assignedSupportThreads SupportThread[] @relation("SupportAssigned")
+  createdSupportThreads  SupportThread[] @relation("SupportCreated")
+
+  @@map("admin_users")
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  COMPLIANCE
+  SUPPORT
+  SALES
+  FINANCE
+}
+
+model AdminAuditLog {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  adminUserId  String    @map("admin_user_id") @db.Uuid
+  action       String    @db.VarChar(64)
+  resourceType String?   @map("resource_type") @db.VarChar(64)
+  resourceId   String?   @map("resource_id") @db.VarChar(128)
+  before       Json?
+  after        Json?
+  ipAddress    String?   @map("ip_address") @db.VarChar(45)
+  userAgent    String?   @map("user_agent") @db.Text
+  createdAt    DateTime  @default(now()) @map("created_at")
+  adminUser    AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  @@index([adminUserId, createdAt])
+  @@index([resourceType, resourceId])
+  @@map("admin_audit_logs")
+}
+
+model AdminLoginAttempt {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String   @db.VarChar(255)
+  succeeded     Boolean
+  failureReason String?  @map("failure_reason") @db.VarChar(100)
+  ipAddress     String?  @map("ip_address") @db.VarChar(45)
+  userAgent     String?  @map("user_agent") @db.Text
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([email, createdAt])
+  @@map("admin_login_attempts")
+}
+
+// ============================================
+// SECTION: SUPPORT CHAT (Phase 3)
+// ============================================
+// Three-party threads bridging admin operators, merchants (tap-app tenants),
+// and suppliers (also tap-app tenants of type SUPPLIER). Merchant/supplier
+// IDs are opaque UUIDs — those tenants live in tap-app's model space and
+// this schema does not FK them. Admin FK uses ON DELETE SET NULL so
+// removing an admin does not orphan history.
+
+enum SupportThreadStatus {
+  OPEN
+  WAITING_MERCHANT
+  WAITING_SUPPLIER
+  WAITING_ADMIN
+  RESOLVED
+  CLOSED
+
+  @@map("support_thread_status")
+}
+
+enum SupportPartyType {
+  ADMIN
+  MERCHANT
+  SUPPLIER
+  SYSTEM
+
+  @@map("support_party_type")
+}
+
+enum SupportEntityType {
+  MERCHANT_APPLICATION
+  PURCHASE_ORDER
+  TRANSACTION
+
+  @@map("support_entity_type")
+}
+
+model SupportThread {
+  id               String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  subject          String              @db.VarChar(255)
+  status           SupportThreadStatus @default(OPEN)
+  entityType       SupportEntityType?  @map("entity_type")
+  entityId         String?             @map("entity_id") @db.VarChar(128)
+  merchantTenantId String?             @map("merchant_tenant_id") @db.Uuid
+  supplierTenantId String?             @map("supplier_tenant_id") @db.Uuid
+  createdByType    SupportPartyType    @map("created_by_type")
+  createdByAdminId String?             @map("created_by_admin_id") @db.Uuid
+  createdByUserId  String?             @map("created_by_user_id") @db.VarChar(128)
+  createdByName    String?             @map("created_by_name") @db.VarChar(255)
+  assignedAdminId  String?             @map("assigned_admin_id") @db.Uuid
+  lastMessageAt    DateTime            @default(now()) @map("last_message_at")
+  closedAt         DateTime?           @map("closed_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  messages       SupportMessage[]
+  readReceipts   SupportReadReceipt[]
+  assignedAdmin  AdminUser?       @relation("SupportAssigned", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+  createdByAdmin AdminUser?       @relation("SupportCreated", fields: [createdByAdminId], references: [id], onDelete: SetNull)
+
+  @@index([status, lastMessageAt(sort: Desc)])
+  @@index([merchantTenantId, lastMessageAt(sort: Desc)])
+  @@index([supplierTenantId, lastMessageAt(sort: Desc)])
+  @@index([entityType, entityId])
+  @@index([assignedAdminId])
+  @@map("support_threads")
+}
+
+model SupportMessage {
+  id           String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  threadId     String           @map("thread_id") @db.Uuid
+  senderType   SupportPartyType @map("sender_type")
+  senderId     String?          @map("sender_id") @db.VarChar(128)
+  senderName   String?          @map("sender_name") @db.VarChar(255)
+  body         String           @db.Text
+  internalNote Boolean          @default(false) @map("internal_note")
+  createdAt    DateTime         @default(now()) @map("created_at")
+
+  thread      SupportThread              @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  attachments SupportMessageAttachment[]
+
+  @@index([threadId, createdAt])
+  @@map("support_messages")
+}
+
+// Phase 3b — attachments (private, served via presigned URLs) + per-user
+// read receipts for unread badges.
+
+model SupportMessageAttachment {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  messageId    String   @map("message_id") @db.Uuid
+  s3Key        String   @map("s3_key") @db.Text
+  fileName     String   @map("file_name") @db.VarChar(255)
+  contentType  String   @map("content_type") @db.VarChar(128)
+  sizeBytes    BigInt   @map("size_bytes")
+  uploadedAt   DateTime @default(now()) @map("uploaded_at")
+
+  message      SupportMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@map("support_message_attachments")
+}
+
+// Composite PK (threadId, readerType, readerId) — one row per user per
+// thread. readerId is opaque so admin-user ids and tap-app user ids both
+// fit without a discriminator table.
+model SupportReadReceipt {
+  threadId    String           @map("thread_id") @db.Uuid
+  readerType  SupportPartyType @map("reader_type")
+  readerId    String           @map("reader_id") @db.VarChar(128)
+  lastReadAt  DateTime         @default(now()) @map("last_read_at")
+
+  thread      SupportThread    @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@id([threadId, readerType, readerId])
+  @@index([readerType, readerId])
+  @@map("support_read_receipts")
+}
