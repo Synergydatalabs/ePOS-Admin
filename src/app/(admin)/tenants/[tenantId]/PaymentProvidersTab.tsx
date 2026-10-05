@@ -13,9 +13,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
-const CAPABILITIES = ["CARD", "INTERAC", "GIFT_CARD", "ACH"] as const;
+const CAPABILITIES = ["CARD", "INTERAC", "GIFT_CARD", "ACH", "ECOMMERCE"] as const;
 type Capability = (typeof CAPABILITIES)[number];
-type Processor = "GP" | "MONERIS";
+type Processor = "GP" | "MONERIS" | "STRIPE";
 type Status = "ACTIVE" | "PENDING" | "SUSPENDED";
 
 interface ProviderRow {

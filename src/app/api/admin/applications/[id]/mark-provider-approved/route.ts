@@ -28,7 +28,7 @@ import { kybEncryptJson } from "@/lib/kyb-crypto";
 
 const APPROVE_ROLES = new Set(["SUPER_ADMIN", "COMPLIANCE"]);
 const ALLOWED_PROCESSORS = new Set(["GP", "MONERIS"]);
-const ALLOWED_CAPABILITIES = new Set(["CARD", "INTERAC", "GIFT_CARD", "ACH"]);
+const ALLOWED_CAPABILITIES = new Set(["CARD", "INTERAC", "GIFT_CARD", "ACH", "ECOMMERCE"]);
 
 interface CredsGp {
   app_id: string;

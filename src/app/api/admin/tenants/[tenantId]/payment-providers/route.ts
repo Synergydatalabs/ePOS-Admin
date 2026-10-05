@@ -23,7 +23,7 @@ import { logAdminAction } from "@/lib/admin-audit";
 import { ALLOWED_PROCESSORS } from "@/lib/providers/registry";
 
 const WRITE_ROLES = new Set(["SUPER_ADMIN", "COMPLIANCE"]);
-const ALLOWED_CAPABILITIES = new Set(["CARD", "INTERAC", "GIFT_CARD", "ACH"]);
+const ALLOWED_CAPABILITIES = new Set(["CARD", "INTERAC", "GIFT_CARD", "ACH", "ECOMMERCE"]);
 
 export async function GET(
   _request: NextRequest,
