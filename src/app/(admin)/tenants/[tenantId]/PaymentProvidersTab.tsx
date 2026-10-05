@@ -79,12 +79,13 @@ export default function PaymentProvidersTab({ tenantId }: { tenantId: string }) 
   const canWrite = WRITE_ROLES.has(role);
 
   const grouped = useMemo(() => {
-    const out: Record<Capability, ProviderRow[]> = {
-      CARD: [],
-      INTERAC: [],
-      GIFT_CARD: [],
-      ACH: [],
-    };
+    // Seed one bucket per declared capability so grouped[cap] is never
+    // undefined. Keeping this derived from CAPABILITIES means adding a
+    // new capability later only needs the one-line addition at the top.
+    const out = CAPABILITIES.reduce((acc, cap) => {
+      acc[cap] = [];
+      return acc;
+    }, {} as Record<Capability, ProviderRow[]>);
     (rows || []).forEach((r) => {
       // Prisma-generated capability may include future values (schema-level
       // enum). Guard against unknown values so the UI doesn't crash.
