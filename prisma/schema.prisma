@@ -4105,6 +4105,12 @@ enum TenantPaymentCapability {
   INTERAC
   GIFT_CARD
   ACH
+  // ECOMMERCE — online hosted-checkout payments (Stripe Link, GP Drop-In,
+  // MCO QR link). Distinct from CARD (card-present via paired terminal)
+  // so a tenant can run GP on CARD + Stripe/GP on ECOMMERCE at the same
+  // time without hitting the (tenantId, capability) uniqueness rule.
+  // Kept in sync with tap-app/prisma/schema.prisma and the Postgres enum.
+  ECOMMERCE
 }
 
 // KYB / onboarding document categories. Persisted as a Postgres enum so the
